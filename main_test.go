@@ -8,64 +8,13 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
-
-func TestBaseSuite(t *testing.T) {
-	cases := map[string]string{
-		"noble":            "noble",
-		"noble-updates":    "noble",
-		"noble-security":   "noble",
-		"noble-backports":  "noble",
-		"resolute":         "resolute",
-		"resolute-updates": "resolute",
-	}
-	for in, want := range cases {
-		if got := baseSuite(in); got != want {
-			t.Errorf("baseSuite(%q) = %q, want %q", in, got, want)
-		}
-	}
-}
-
-func TestParseReleaseTime(t *testing.T) {
-	for _, s := range []string{
-		"Thu, 11 Sep 2026 14:35:21 UTC",
-		"Thu, 11 Sep 2026 14:35:21 +0000",
-	} {
-		got, err := parseReleaseTime(s)
-		if err != nil {
-			t.Fatalf("parseReleaseTime(%q): %v", s, err)
-		}
-		if got.Year() != 2026 || got.Day() != 11 {
-			t.Errorf("parseReleaseTime(%q) = %v", s, got)
-		}
-	}
-}
-
-func TestIsUbuntuArchive(t *testing.T) {
-	yes := []string{
-		"http://archive.ubuntu.com/ubuntu/",
-		"http://ports.ubuntu.com/ubuntu-ports/",
-		"http://ftp.uni-stuttgart.de/ubuntu/",
-	}
-	no := []string{
-		"https://deb.nodesource.com/node_22.x",
-		"http://ppa.launchpadcontent.net/git-core/ppa/ubuntu",
-	}
-	for _, u := range yes {
-		if !isUbuntuArchive(u) {
-			t.Errorf("isUbuntuArchive(%q) = false, want true", u)
-		}
-	}
-	for _, u := range no {
-		if isUbuntuArchive(u) {
-			t.Errorf("isUbuntuArchive(%q) = true, want false", u)
-		}
-	}
-}
 
 func TestNormalizeMirrorURL(t *testing.T) {
 	if got := normalizeMirrorURL("http://example.org/ubuntu"); got != "http://example.org/ubuntu/" {
@@ -1097,5 +1046,46 @@ func TestPrintTableStripsControlCharactersFromMirrorText(t *testing.T) {
 	// The diagnostic itself must survive: stripping is not censoring.
 	if !strings.Contains(row, "dists/") || !strings.Contains(row, "noble/fake") {
 		t.Errorf("row lost the diagnostic text: %q", row)
+	}
+}
+
+// /etc/os-release is the only thing aptmir will take a codename from, so its
+// parsing carries the whole detection. The spec allows either quoting style
+// and tolerates trailing whitespace, and anything it cannot read must come
+// back empty so the caller reports that the codename is unknown rather than
+// ranking mirrors for a release the machine is not running.
+func TestCodenameFromOSRelease(t *testing.T) {
+	cases := map[string]struct {
+		content string
+		want    string
+	}{
+		"bare":            {"VERSION_CODENAME=noble\n", "noble"},
+		"double quoted":   {"VERSION_CODENAME=\"noble\"\n", "noble"},
+		"single quoted":   {"VERSION_CODENAME='noble'\n", "noble"},
+		"trailing space":  {"VERSION_CODENAME=noble  \n", "noble"},
+		"carriage return": {"VERSION_CODENAME=noble\r\n", "noble"},
+		"among others":    {"ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n", "noble"},
+		"key absent":      {"ID=ubuntu\nVERSION_ID=\"24.04\"\n", ""},
+		"value empty":     {"VERSION_CODENAME=\n", ""},
+		"quotes empty":    {"VERSION_CODENAME=\"\"\n", ""},
+		"not a prefix":    {"UBUNTU_VERSION_CODENAME=noble\n", ""},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "os-release")
+			if err := os.WriteFile(path, []byte(c.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if got := codenameFromOSRelease(path); got != c.want {
+				t.Errorf("codenameFromOSRelease() = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+func TestCodenameFromOSReleaseMissingFile(t *testing.T) {
+	got := codenameFromOSRelease(filepath.Join(t.TempDir(), "absent"))
+	if got != "" {
+		t.Errorf("codenameFromOSRelease() = %q for a missing file, want \"\"", got)
 	}
 }

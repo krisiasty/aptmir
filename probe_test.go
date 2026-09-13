@@ -759,9 +759,9 @@ func TestNearestKeepsTheClosestAndDropsDeadOnes(t *testing.T) {
 }
 
 func TestMeasureBandwidthPrimesTheCacheWhenCachingIsAllowed(t *testing.T) {
-	// -allow-caching has to reach this phase too. If it only relaxed the sweep,
-	// a CDN-fronted mirror would pass the cut and then be measured on its cold
-	// path, lose anyway, and the flag would appear to do nothing.
+	// Caching has to reach this phase too. If it only relaxed the sweep, a
+	// CDN-fronted mirror would pass the cut and then be measured on its cold
+	// path, lose anyway, and -no-cache would appear to change nothing.
 	var mu sync.Mutex
 	fetches := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -795,7 +795,7 @@ func TestMeasureBandwidthPrimesTheCacheWhenCachingIsAllowed(t *testing.T) {
 	warm := fetches - cold
 	mu.Unlock()
 	if warm != 2 {
-		t.Errorf("-allow-caching made %d fetches, want 2 (prime then measure)", warm)
+		t.Errorf("cached path made %d fetches, want 2 (prime then measure)", warm)
 	}
 }
 

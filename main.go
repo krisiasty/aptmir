@@ -1,8 +1,11 @@
 // Command aptmir ranks Ubuntu archive mirrors by measured freshness and
-// throughput, and can rewrite the local apt sources to use the best one.
+// throughput and reports what it found. It does not change the system and has
+// no write path: nothing it prints takes effect until you edit your apt
+// sources yourself.
 //
-// It understands both the legacy one-line sources format and the deb822
-// format that Ubuntu adopted as the default in 24.04, so it works on 22.04
+// Autodetection reads /etc/os-release for the release codename and runs dpkg
+// for the architecture, both read-only and both replaceable with -codename and
+// -arch. Every other input is a network fetch, so the tool works on 22.04
 // through 26.04 and later without special-casing individual releases.
 package main
 
@@ -21,7 +24,6 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"slices"
 	"sort"
@@ -234,7 +236,7 @@ func run(ctx context.Context, cfg *config) error {
 		cfg.arch = detectArch(ctx)
 	}
 	if cfg.codename == "" {
-		cn, err := detectCodename(ctx)
+		cn, err := detectCodename()
 		if err != nil {
 			return err
 		}
@@ -541,172 +543,43 @@ func detectArch(ctx context.Context) string {
 	return "amd64"
 }
 
-// detectCodename prefers /etc/os-release, which is authoritative for the
-// running system and present on every supported release. The sources files
-// are only consulted as a fallback, and then only for stanzas that actually
-// point at an Ubuntu archive, so a third-party repo such as NodeSource
-// (Suites: nodistro) cannot be mistaken for the release codename.
-func detectCodename(ctx context.Context) (string, error) {
-	if cn := codenameFromOSRelease(); cn != "" {
+// osReleasePath is where the running system records its own identity.
+const osReleasePath = "/etc/os-release"
+
+// detectCodename reads the release codename from /etc/os-release, which is the
+// only source aptmir will take one from.
+//
+// Earlier versions fell back to scanning /etc/apt, and then to lsb_release.
+// Both were dropped. Deciding whether a source line belongs to the Ubuntu
+// archive meant guessing from its host and path, and the guess was wrong in
+// both directions: it accepted any third-party repository published under a
+// /ubuntu path, and any host whose name merely ended in the right letters.
+// A second source of truth that can disagree with the first is worse than no
+// second source at all, because a wrong codename is not obviously wrong — it
+// ranks mirrors for a release the machine is not running. Reporting that the
+// codename is unknown, and letting -codename settle it, is the honest answer.
+func detectCodename() (string, error) {
+	if cn := codenameFromOSRelease(osReleasePath); cn != "" {
 		return cn, nil
-	}
-	if cn := codenameFromDeb822(); cn != "" {
-		return cn, nil
-	}
-	if cn := codenameFromLegacy(); cn != "" {
-		return cn, nil
-	}
-	out, err := exec.CommandContext(ctx, "lsb_release", "-cs").Output()
-	if err == nil {
-		if cn := strings.TrimSpace(string(out)); cn != "" {
-			return cn, nil
-		}
 	}
 	return "", errors.New("could not determine the release codename; pass -codename")
 }
 
-// baseSuite strips the -updates/-security/-backports/-proposed qualifier.
-func baseSuite(s string) string {
-	for _, suffix := range []string{"-updates", "-security", "-backports", "-proposed"} {
-		if base, ok := strings.CutSuffix(s, suffix); ok {
-			return base
-		}
-	}
-	return s
-}
-
-// isUbuntuArchive reports whether a URI belongs to the Ubuntu archive proper
-// rather than a PPA or an unrelated third-party repository.
-func isUbuntuArchive(uri string) bool {
-	u, err := url.Parse(strings.TrimSpace(uri))
-	if err != nil || u.Host == "" {
-		return false
-	}
-	host := strings.ToLower(u.Host)
-	if strings.Contains(host, "ppa.launchpad") {
-		return false
-	}
-	return strings.HasSuffix(host, "ubuntu.com") ||
-		strings.Contains(strings.ToLower(u.Path), "/ubuntu")
-}
-
-// codenameFromDeb822 walks each stanza, keeping URIs and Suites together so
-// that a suite is only trusted when its stanza points at an Ubuntu archive.
-func codenameFromDeb822() string {
-	paths, _ := filepath.Glob("/etc/apt/sources.list.d/*.sources")
-	for _, p := range paths {
-		//nolint:gosec // G304: p is a filepath.Glob match under /etc/apt, not caller input.
-		data, err := os.ReadFile(p)
-		if err != nil {
-			continue
-		}
-		for stanza := range strings.SplitSeq(string(data), "\n\n") {
-			var uris, suites []string
-			for line := range strings.SplitSeq(stanza, "\n") {
-				line = strings.TrimSpace(line)
-				if line == "" || strings.HasPrefix(line, "#") {
-					continue
-				}
-				lower := strings.ToLower(line)
-				switch {
-				case strings.HasPrefix(lower, "uris:"):
-					uris = append(uris, strings.Fields(line[len("uris:"):])...)
-				case strings.HasPrefix(lower, "suites:"):
-					suites = append(suites, strings.Fields(line[len("suites:"):])...)
-				}
-			}
-			if !slices.ContainsFunc(uris, isUbuntuArchive) {
-				continue
-			}
-			for _, s := range suites {
-				if b := baseSuite(s); b == s && b != "" {
-					return b
-				}
-			}
-			if len(suites) > 0 {
-				return baseSuite(suites[0])
-			}
-		}
-	}
-	return ""
-}
-
-func codenameFromLegacy() string {
-	paths := []string{"/etc/apt/sources.list"}
-	more, _ := filepath.Glob("/etc/apt/sources.list.d/*.list")
-	paths = append(paths, more...)
-	for _, p := range paths {
-		if cn := codenameFromLegacyFile(p); cn != "" {
-			return cn
-		}
-	}
-	return ""
-}
-
-// codenameFromLegacyFile scans one one-line-format sources file and returns
-// the first unqualified suite belonging to an Ubuntu archive.
-func codenameFromLegacyFile(path string) string {
-	//nolint:gosec // G304: path is a fixed /etc/apt location or a glob match, not caller input.
-	f, err := os.Open(path)
+func codenameFromOSRelease(path string) string {
+	//nolint:gosec // G304: the caller passes a fixed system path; tests pass their own.
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}
-	defer func() { _ = f.Close() }()
-
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
+	for line := range strings.SplitSeq(string(data), "\n") {
+		// os-release permits either quoting style around a value, and the file
+		// is edited by hand often enough that stray whitespace and CRLF line
+		// endings both turn up.
+		after, ok := strings.CutPrefix(strings.TrimSpace(line), "VERSION_CODENAME=")
+		if !ok {
 			continue
 		}
-		fields := strings.Fields(line)
-		// deb [opts] URI suite components...
-		if len(fields) < 3 || (fields[0] != "deb" && fields[0] != "deb-src") {
-			continue
-		}
-		i := 1
-		for i < len(fields) && strings.HasPrefix(fields[i], "[") {
-			for i < len(fields) && !strings.HasSuffix(fields[i], "]") {
-				i++
-			}
-			i++
-		}
-		if i+1 >= len(fields) {
-			continue
-		}
-		if !isUbuntuArchive(fields[i]) {
-			continue
-		}
-		suite := fields[i+1]
-		if b := baseSuite(suite); b == suite {
-			return b
-		}
-	}
-	// A read error mid-file is not the same as reaching the end: without this
-	// a truncated sources file silently reports "no codename found".
-	if err := sc.Err(); err != nil {
-		return ""
-	}
-	return ""
-}
-
-func codenameFromOSRelease() string {
-	f, err := os.Open("/etc/os-release")
-	if err != nil {
-		return ""
-	}
-	defer func() { _ = f.Close() }()
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := sc.Text()
-		if after, ok := strings.CutPrefix(line, "VERSION_CODENAME="); ok {
-			return strings.Trim(after, `"`)
-		}
-	}
-	// Distinguish a genuine absence from a failed read, so the caller falls
-	// through to the other detectors rather than trusting an empty answer.
-	if err := sc.Err(); err != nil {
-		return ""
+		return strings.Trim(strings.TrimSpace(after), `"'`)
 	}
 	return ""
 }

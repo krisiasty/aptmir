@@ -1,16 +1,16 @@
 # aptmir
 
 Ranks Ubuntu archive mirrors by measured freshness and throughput, and reports
-what it found. It covers the ranking half of `apt-smart` and understands the
-deb822 sources format Ubuntu has shipped by default since 24.04, so it works on
-22.04 through 26.04 and later. Changing your sources is left to you.
+what it found. It covers the ranking half of `apt-smart`, and works on 22.04
+through 26.04 and later without special-casing individual releases. Changing
+your sources is left to you.
 
 Standard library only — no dependencies, nothing to break.
 
 ## Platforms
 
-Linux is the target: the tool reads `/etc/os-release` and `/etc/apt`, and shells
-out to `dpkg` and `lsb_release`. Releases also carry macOS binaries for
+Linux is the target: the tool reads `/etc/os-release` and shells out to `dpkg`.
+Releases also carry macOS binaries for
 development convenience, where autodetection cannot work and `-codename` and
 `-arch` have to be given explicitly. Windows is not built, having none of the
 above.
@@ -401,10 +401,14 @@ for `BANDWIDTH` higher is.
 
 ## Safety
 
-aptmir does not modify your system. It has no write path: it reads
-`/etc/apt` only to detect your release codename, and everything else it
-touches is a network fetch. Nothing it prints takes effect until you edit
-your sources yourself.
+aptmir does not modify your system. It has no write path at all.
+
+What it does locally is autodetection, and only that: it reads
+`/etc/os-release` for your release codename and runs `dpkg --print-architecture`
+for your architecture. Both are read-only, and `-codename` and `-arch` replace
+them, which is what the macOS builds rely on. `/etc/apt` is not read. Everything
+else the tool touches is a network fetch, and nothing it prints takes effect
+until you edit your sources yourself.
 
 Probes refuse to connect to a non-public address. Loopback, private, link-local,
 carrier-grade NAT, unspecified and multicast destinations are rejected at the
@@ -440,14 +444,19 @@ change deliberately.
 
 ## Notes on releases
 
-- The codename comes from `/etc/os-release` first, which is authoritative and
-  present on every supported release. The sources files are a fallback, and
-  only stanzas pointing at an Ubuntu archive are considered — a third-party
-  repo such as NodeSource (`Suites: nodistro`) cannot be mistaken for the
-  release.
-- Both `/etc/apt/sources.list` (legacy one-line) and
-  `/etc/apt/sources.list.d/*.sources` (deb822) are parsed, so no release-specific
-  handling is needed as new versions land.
+- The codename comes from `/etc/os-release`, and from nowhere else. It is
+  authoritative for the running system and present on every supported release,
+  so no release-specific handling is needed as new versions land. If the file is
+  missing or carries no `VERSION_CODENAME`, the run stops and asks for
+  `-codename` rather than guessing.
+- Earlier versions fell back to scanning `/etc/apt` and then to `lsb_release`.
+  Both were dropped. Deciding whether a source line belongs to the Ubuntu
+  archive meant guessing from its host and path, and the guess was wrong in both
+  directions: any third-party repository published under a `/ubuntu` path was
+  accepted, as was any host whose name merely ended in the right letters. A
+  wrong codename is not obviously wrong — it ranks mirrors for a release you are
+  not running — so a second source of truth that can disagree with the first is
+  worse than no second source at all.
 - If the release is end-of-life, the tool detects that the archive no longer
   carries it and points you at `old-releases.ubuntu.com` rather than ranking
   mirrors that cannot serve you.
