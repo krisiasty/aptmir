@@ -18,6 +18,50 @@ import (
 	"time"
 )
 
+// The public -timeout contract covers the response body, not only connection
+// setup and headers. A server that flushes headers and then stalls must not be
+// able to hold discovery or metadata reads indefinitely.
+func TestNewClientBoundsResponseBody(t *testing.T) {
+	const timeout = 50 * time.Millisecond
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("test server response writer does not support flushing")
+			return
+		}
+		flusher.Flush()
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err := newClient(timeout).Do(req)
+	if err != nil {
+		t.Fatalf("request headers: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// Bounded, because the handler never ends the body on its own: without
+	// this a regression hangs the whole test binary instead of failing here.
+	start := time.Now()
+	var readErr error
+	if !runBounded(t, 10*time.Second, func() { _, readErr = io.ReadAll(resp.Body) }) {
+		t.Fatal("body read did not return within 10s: the complete-request timeout is not bounding it")
+	}
+	if readErr == nil {
+		t.Fatal("body read succeeded; want the complete-request timeout to interrupt it")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("body timeout took %v, want well under 1s", elapsed)
+	}
+}
+
 // Phase 2 must run sequentially: overlapping downloads share the client uplink
 // and produce a different winner on every run.
 func TestMeasureTopIsSequential(t *testing.T) {
@@ -94,6 +138,44 @@ func TestScreenCleanMirrorSkipsVerification(t *testing.T) {
 	}
 	if got := indexHits.Load(); got != 0 {
 		t.Errorf("index verification requests = %d, want 0 for a clean mirror (cost guard bypassed)", got)
+	}
+}
+
+// Screening deliberately has a larger budget than an ordinary request because
+// a marked mirror may need to stream several indexes. The base client timeout
+// must therefore not cut off a valid screening body early.
+func TestScreenUsesExtendedBodyBudget(t *testing.T) {
+	const timeout = 50 * time.Millisecond
+	const bodyDelay = 3 * timeout
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/dists/noble/InRelease":
+			w.WriteHeader(http.StatusOK)
+			flusher, ok := w.(http.Flusher)
+			if !ok {
+				t.Error("test server response writer does not support flushing")
+				return
+			}
+			flusher.Flush()
+			select {
+			case <-time.After(bodyDelay):
+				_, _ = io.WriteString(w, "Origin: Ubuntu\nDate: "+
+					time.Now().UTC().Format("Mon, 02 Jan 2006 15:04:05 MST")+"\n")
+			case <-r.Context().Done():
+			}
+		case "/":
+			_, _ = io.WriteString(w, `<a href="dists/">dists/</a>`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	cfg := &config{codename: "noble", arch: "amd64", timeout: timeout, maxAge: time.Hour}
+	m := &Mirror{URL: srv.URL + "/"}
+	screen(t.Context(), newClient(timeout), cfg, m)
+	if m.Err != "" || !m.Reachable {
+		t.Errorf("screen rejected a body inside its extended budget: %+v", m)
 	}
 }
 
@@ -244,6 +326,38 @@ func TestMeasureBandwidthExcludesWarmup(t *testing.T) {
 	}
 	if bw < minBandwidth {
 		t.Errorf("bandwidth = %.0f bytes/s, want >= %d (warm-up not excluded from timed window?)", bw, minBandwidth)
+	}
+}
+
+// A bandwidth probe has its own budget, which may exceed the base request
+// timeout. The client copy used by timedPull must honor that longer budget.
+func TestTimedPullUsesBandwidthBudget(t *testing.T) {
+	const timeout = 50 * time.Millisecond
+	const bodyDelay = 3 * timeout
+	const probeBytes = 1 << 20
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("test server response writer does not support flushing")
+			return
+		}
+		flusher.Flush()
+		select {
+		case <-time.After(bodyDelay):
+			_, _ = w.Write(bytes.Repeat([]byte{'x'}, warmupBytes+probeBytes))
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	cfg := &config{probeBytes: probeBytes, probeTime: time.Second, timeout: timeout}
+	bw, low, err := timedPull(t.Context(), newClient(timeout), cfg, srv.URL)
+	if err != nil {
+		t.Fatalf("timedPull: %v", err)
+	}
+	if low || bw <= 0 {
+		t.Errorf("timedPull = (%v, low=%v), want a normal positive measurement", bw, low)
 	}
 }
 

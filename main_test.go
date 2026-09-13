@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -423,6 +425,41 @@ func TestLaunchpadMirrorURLsKeepsEveryUsableScheme(t *testing.T) {
 		if got[i].URL != want[i] {
 			t.Errorf("URL %d = %q, want %q", i, got[i].URL, want[i])
 		}
+	}
+}
+
+// The Launchpad listing is the one discovery fetch large enough that the base
+// per-request timeout would cut its body off on a slow link, taking every ports
+// mirror and https variant with it. It gets launchpadBudget instead.
+func TestFetchLaunchpadMirrorsOutlastsTheBaseTimeout(t *testing.T) {
+	const timeout = 300 * time.Millisecond
+	// Well past one timeout, well inside launchpadBudget.
+	const stall = 2 * timeout
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("test server response writer does not support flushing")
+			return
+		}
+		_, _ = io.WriteString(w, `<a href="http://ftp.uni-stuttgart.de/ubuntu/">http</a>`)
+		flusher.Flush()
+		select {
+		case <-time.After(stall):
+		case <-r.Context().Done():
+			return
+		}
+		_, _ = io.WriteString(w, `<a href="https://ftp.uni-stuttgart.de/ubuntu/">https</a>`)
+	}))
+	t.Cleanup(srv.Close)
+
+	got, err := fetchLaunchpadMirrors(t.Context(), newClient(timeout), srv.URL, timeout)
+	if err != nil {
+		t.Fatalf("fetch: %v; the listing body must get launchpadBudget (%v), not the base timeout (%v)",
+			err, launchpadBudget(timeout), timeout)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d mirrors %v, want both halves of the page", len(got), got)
 	}
 }
 

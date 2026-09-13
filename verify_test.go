@@ -204,10 +204,9 @@ func TestVerifyIndexesRejectsImplausibleDeclaredSize(t *testing.T) {
 }
 
 // TestScreenBoundsAStallingMirror covers the second half: a plausible declared
-// size with a body that never arrives. Nothing below screen has a deadline —
-// ResponseHeaderTimeout has already fired by the time a body is being read — so
-// screen itself must bound the mirror, or screenAll's WaitGroup never returns
-// and aptmir hangs with no output at all.
+// size with a body that never arrives. Screening extends the ordinary request
+// timeout to allow large index reads, so its own whole-mirror deadline must
+// still bound the work or screenAll's WaitGroup never returns.
 func TestScreenBoundsAStallingMirror(t *testing.T) {
 	base, _ := newStallingMirror(t, 4<<20) // well inside maxIndexBytes
 
