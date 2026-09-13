@@ -554,6 +554,12 @@ const (
 	// measureBytes is the default size of the timed measurement window: the
 	// default value of the -probe-bytes flag, which cfg.probeBytes holds.
 	measureBytes = 6 << 20
+	// materialWindowShare is how much of either measurement budget a window
+	// cut short by EOF must still have covered for its figure to count as a
+	// normal measurement. A body ending just shy of the budget was timed over
+	// enough of a transfer to mean something; one ending just past the warm-up
+	// was not timed so much as clocked draining the socket buffer.
+	materialWindowShare = 0.5
 )
 
 // measureBandwidth reports sustained throughput in bytes per second. It pulls a
@@ -585,7 +591,8 @@ func measureBandwidth(ctx context.Context, client *http.Client, cfg *config, bas
 		if err == nil {
 			// Either reason is enough to distrust the figure: a small target,
 			// or a measurement that had to time the warm-up because the body
-			// ended inside it. The latter is reachable on Contents-<arch>.gz
+			// ended inside it, or too soon after it for the measured window to
+			// have measured anything. The latter is reachable on Contents-<arch>.gz
 			// too — a mirror serving a truncated or tiny Contents file lands
 			// there — so it cannot be inferred from the target alone.
 			return bw, target.low || fellBack, nil
@@ -598,6 +605,8 @@ func measureBandwidth(ctx context.Context, client *http.Client, cfg *config, bas
 // timedPull downloads warmupBytes, discards them, then times the next window.
 // The second result reports that it could not do that and timed the whole
 // transfer instead, which makes the figure low-confidence whatever the target.
+// A read that fails rather than ends, in either window, is returned as an
+// error: the bytes that arrived before it broke measure nothing.
 func timedPull(ctx context.Context, client *http.Client, cfg *config, u string) (float64, bool, error) {
 	budget := cfg.probeTime + 2*cfg.timeout
 	ctx, cancel := context.WithTimeout(ctx, budget)
@@ -644,33 +653,53 @@ func timedPull(ctx context.Context, client *http.Client, cfg *config, u string) 
 	deadline := time.Now().Add(cfg.probeTime)
 	var total int64
 	start := time.Now()
+	var truncated bool
 	for total < cfg.probeBytes && time.Now().Before(deadline) {
-		n, err := resp.Body.Read(buf)
+		n, rerr := resp.Body.Read(buf)
 		total += int64(n)
-		if err != nil {
+		if rerr != nil {
+			if !errors.Is(rerr, io.EOF) {
+				// The transfer broke rather than ended, exactly as the
+				// warm-up loop above treats the same failure. Whatever
+				// arrived before it broke is a fragment of an interrupted
+				// window, not a measurement of the mirror.
+				return 0, false, fmt.Errorf("measured window: %w", rerr)
+			}
+			truncated = true
 			break
 		}
 	}
-	if total > 0 {
-		debugLog.Debug("pull", "url", u, "timed_bytes", total, "warmup_bytes", discarded)
-		elapsed := time.Since(start).Seconds()
+	elapsed := time.Since(start).Seconds()
+	// A window that ran out either budget — probeBytes read, or probeTime
+	// elapsed — timed what it was meant to. One cut short by EOF only counts
+	// if it still covered a material share of one of them: a body ending a
+	// few kilobytes past the warm-up leaves a sample that was sitting in the
+	// socket buffer rather than crossing the wire, so timing it reports an
+	// arbitrary and usually enormous rate. Ranking sorts on the figure alone,
+	// so such a sample would outrank every honestly measured mirror.
+	measured := !truncated ||
+		float64(total) >= materialWindowShare*float64(cfg.probeBytes) ||
+		elapsed >= materialWindowShare*cfg.probeTime.Seconds()
+	if total > 0 && measured {
+		debugLog.Debug("pull", "url", u, "timed_bytes", total, "warmup_bytes", discarded, "truncated", truncated)
 		if elapsed <= 0 {
 			return 0, false, errors.New("no data after warm-up")
 		}
 		return float64(total) / elapsed, false, nil
 	}
 
-	// The measured phase produced nothing: the source ended at or before
-	// warmupBytes, whether or not the discard loop above happened to observe
-	// that EOF directly. Time the whole transfer instead of failing outright,
-	// and say so: this figure includes the slow-start ramp the warm-up exists
-	// to exclude, so it is low-confidence whichever target produced it. The
-	// small Packages.gz fallback is the expected way to land here, but a
-	// truncated or unexpectedly tiny Contents-<arch>.gz lands here too, which
-	// is why the caller cannot infer it from the target alone.
-	elapsed := time.Since(warmupStart).Seconds()
-	if elapsed <= 0 || discarded == 0 {
+	// The measured phase produced nothing worth timing: the source ended at or
+	// before warmupBytes, whether or not the discard loop above happened to
+	// observe that EOF directly, or so soon after it that the sample above was
+	// rejected. Time the whole transfer instead of failing outright, and say
+	// so: this figure includes the slow-start ramp the warm-up exists to
+	// exclude, so it is low-confidence whichever target produced it. The small
+	// Packages.gz fallback is the expected way to land here, but a truncated
+	// or unexpectedly tiny Contents-<arch>.gz lands here too, which is why the
+	// caller cannot infer it from the target alone.
+	elapsed = time.Since(warmupStart).Seconds()
+	if elapsed <= 0 || discarded+total == 0 {
 		return 0, false, errors.New("no data")
 	}
-	return float64(discarded) / elapsed, true, nil
+	return float64(discarded+total) / elapsed, true, nil
 }
