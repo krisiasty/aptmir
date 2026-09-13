@@ -1,16 +1,16 @@
 # aptmir
 
-Ranks Ubuntu archive mirrors by measured freshness and throughput, and
-optionally rewrites your apt sources to use the best one. A replacement for
-`apt-smart` that understands the deb822 sources format Ubuntu has shipped by
-default since 24.04, so it works on 22.04 through 26.04 and later.
+Ranks Ubuntu archive mirrors by measured freshness and throughput, and reports
+what it found. It covers the ranking half of `apt-smart` and understands the
+deb822 sources format Ubuntu has shipped by default since 24.04, so it works on
+22.04 through 26.04 and later. Changing your sources is left to you.
 
 Standard library only — no dependencies, nothing to break.
 
 ## Platforms
 
-Linux is the target: the tool reads `/etc/os-release`, shells out to `dpkg` and
-`lsb_release`, and rewrites `/etc/apt`. Releases also carry macOS binaries for
+Linux is the target: the tool reads `/etc/os-release` and `/etc/apt`, and shells
+out to `dpkg` and `lsb_release`. Releases also carry macOS binaries for
 development convenience, where autodetection cannot work and `-codename` and
 `-arch` have to be given explicitly. Windows is not built, having none of the
 above.
@@ -28,13 +28,13 @@ brew install --cask krisiasty/tap/aptmir
 
 ## Usage
 
-Rank mirrors, change nothing:
+Rank mirrors:
 
 ```sh
 aptmir
 ```
 
-Restrict to a specific countries and probe more candidates:
+Restrict to specific countries:
 
 ```sh
 aptmir -country pl,de
@@ -391,14 +391,14 @@ change deliberately.
   repo such as NodeSource (`Suites: nodistro`) cannot be mistaken for the
   release.
 - Both `/etc/apt/sources.list` (legacy one-line) and
-  `/etc/apt/sources.list.d/*.sources` (deb822) are parsed and rewritten, so no
-  release-specific handling is needed as new versions land.
+  `/etc/apt/sources.list.d/*.sources` (deb822) are parsed, so no release-specific
+  handling is needed as new versions land.
 - If the release is end-of-life, the tool detects that the archive no longer
   carries it and points you at `old-releases.ubuntu.com` rather than ranking
   mirrors that cannot serve you.
 - On arm64/ppc64el/s390x/riscv64 it uses `ports.ubuntu.com`. Since
   `mirrors.ubuntu.com` only indexes the main archive, Launchpad is the only
-  those architectures to pull a wider candidate list.
+  source of a wider candidate list for those architectures.
 
 ## Flags
 
@@ -435,7 +435,6 @@ cases — so the suite needs no network and touches no real mirror.
 
 | Area | What is covered |
 | --- | --- |
-| Sources rewriting | deb822 and legacy formats, `security.ubuntu.com` and PPA preservation, idempotency, and that a rewrite lands by atomic rename rather than in place |
 | Release detection | suite parsing, `Date:` field parsing, codename detection inputs |
 | Sync markers | absent, fresh, and stale markers; a pool that flaps per request and one that flaps per connection, which is how a real load-balanced host behaves |
 | Index verification | a good mirror, a corrupt index, a mirror publishing only `Release`, an index declaring an implausible size, a declared index the mirror does not serve, and a mirror that streams a body forever |
