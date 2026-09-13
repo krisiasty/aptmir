@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -454,6 +455,117 @@ func TestMeasureBandwidthFlagsWholeTransferFallbackOnContents(t *testing.T) {
 	}
 	if !low {
 		t.Error("lowConfidence = false, want true: the figure came from the whole-transfer fallback")
+	}
+}
+
+// stalledBody serves warmupBytes followed by tail bytes, but only after
+// bodyDelay, with the headers flushed first so the stall lands inside the body
+// window timedPull measures rather than being absorbed while waiting for the
+// response headers. The delay is what separates the two figures the tests
+// below distinguish: the whole-transfer fallback spans it and so reports a few
+// MB/s, while a figure timed on the post-warm-up bytes alone reports orders of
+// magnitude more, because those bytes are already waiting in the socket buffer.
+func stalledBody(t *testing.T, bodyDelay time.Duration, tail int64) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		time.Sleep(bodyDelay)
+		_, _ = w.Write(bytes.Repeat([]byte{'w'}, warmupBytes))
+		_, _ = w.Write(bytes.Repeat([]byte{'p'}, int(tail)))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// A transfer that breaks inside the measured window is not a slow mirror, it
+// is a failed read, and the bytes that arrived before it broke measure
+// nothing. The warm-up loop already rejects a non-EOF read error; the measured
+// loop must do the same instead of discarding it and reporting the fragment as
+// a successful measurement.
+func TestTimedPullFailsOnTransportErrorAfterWarmup(t *testing.T) {
+	const tail = 8 << 10
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Promise far more than the handler delivers. The server closes the
+		// connection after the short write, so the client's next body read
+		// fails with io.ErrUnexpectedEOF rather than reaching a clean end.
+		w.Header().Set("Content-Length", strconv.FormatInt(warmupBytes+(1<<20), 10))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(bytes.Repeat([]byte{'w'}, warmupBytes))
+		_, _ = w.Write(bytes.Repeat([]byte{'p'}, tail))
+	}))
+	t.Cleanup(srv.Close)
+
+	cfg := &config{
+		codename: "noble", arch: "amd64", probeBytes: 6 << 20,
+		probeTime: 2 * time.Second, timeout: 10 * time.Second,
+	}
+	bw, low, err := timedPull(t.Context(), srv.Client(), cfg, srv.URL+"/")
+	if err == nil {
+		t.Fatalf("timedPull = (%v, low=%v, nil), want an error: the transfer broke inside the measured window", bw, low)
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("timedPull error = %v, want it to wrap io.ErrUnexpectedEOF: the read error must be preserved, not replaced", err)
+	}
+}
+
+// A body that ends a few kilobytes after the warm-up hands the measured loop a
+// sample that was never transferred at the mirror's pace: it was already in the
+// socket buffer, so timing it reports an arbitrary, usually enormous, rate.
+// Ranking sorts on the figure alone, so such a sample must not come back as a
+// normal measurement; the whole-transfer fallback is the honest figure.
+func TestTimedPullFlagsTinySampleAfterWarmup(t *testing.T) {
+	const tail = 8 << 10
+	const bodyDelay = 300 * time.Millisecond
+	// The fallback figure spans bodyDelay: (2 MiB + 8 KiB) / 300 ms is about
+	// 7 MB/s, while timing the 8 KiB tail on its own gives hundreds of MB/s.
+	const maxBandwidth = 20 << 20
+
+	srv := stalledBody(t, bodyDelay, tail)
+	cfg := &config{
+		codename: "noble", arch: "amd64", probeBytes: 6 << 20,
+		probeTime: 2 * time.Second, timeout: 10 * time.Second,
+	}
+	bw, low, err := timedPull(t.Context(), srv.Client(), cfg, srv.URL+"/")
+	if err != nil {
+		t.Fatalf("timedPull: %v, want the whole-transfer fallback measurement", err)
+	}
+	if !low {
+		t.Error("lowConfidence = false, want true: the measured window ended before it measured anything")
+	}
+	if bw >= maxBandwidth {
+		t.Errorf("bandwidth = %.0f bytes/s, want < %d: the tiny post-warm-up sample must not be timed on its own", bw, maxBandwidth)
+	}
+}
+
+// The converse guard: a window cut short only slightly still timed a real
+// transfer, so it must stay a normal measurement. Replacing it with the
+// whole-transfer fallback would fold the slow-start ramp the warm-up exists to
+// exclude back into the figure and demote an honest mirror.
+func TestTimedPullAcceptsSubstantialTruncatedWindow(t *testing.T) {
+	const probeBytes = 4 << 20
+	const tail = 3 << 20 // three quarters of the byte budget, then a clean EOF
+	const bodyDelay = 500 * time.Millisecond
+	// The fallback figure would be (2 MiB + 3 MiB) / 500 ms, about 10 MB/s,
+	// while the measured window alone crosses loopback at far more than this.
+	const minBandwidth = 20 << 20
+
+	srv := stalledBody(t, bodyDelay, tail)
+	cfg := &config{
+		codename: "noble", arch: "amd64", probeBytes: probeBytes,
+		probeTime: 2 * time.Second, timeout: 10 * time.Second,
+	}
+	bw, low, err := timedPull(t.Context(), srv.Client(), cfg, srv.URL+"/")
+	if err != nil {
+		t.Fatalf("timedPull: %v", err)
+	}
+	if low {
+		t.Error("lowConfidence = true, want false: the window covered most of the byte budget before the body ended")
+	}
+	if bw < minBandwidth {
+		t.Errorf("bandwidth = %.0f bytes/s, want >= %d: a nearly complete window must not be replaced by the whole-transfer figure", bw, minBandwidth)
 	}
 }
 
