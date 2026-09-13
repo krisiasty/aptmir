@@ -106,7 +106,14 @@ func detectMarker(ctx context.Context, client *http.Client, base string) (marker
 	debugLog.Debug("marker seen", "mirror", base, "marker", name, "confirming", true)
 	confirm, err := markerName(ctx, confirmClient, base)
 	if err != nil {
-		return markerInfo{}, err
+		// A confirmation that never answered is not an answer that the marker
+		// is gone. Discarding the sighting here would report a mirror that is
+		// genuinely mid-rsync as one whose root could not be checked at all,
+		// leaving it unverified and ranked as though nothing had been seen.
+		// Report the lock with an age that could not be read instead, which is
+		// what markerStale already means.
+		debugLog.Debug("marker unconfirmable", "mirror", base, "marker", name, "err", shortErr(err))
+		return markerInfo{State: markerStale, Name: name}, nil
 	}
 	if confirm == "" {
 		return markerInfo{Name: name, Unconfirmed: true}, nil

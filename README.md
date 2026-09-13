@@ -344,11 +344,15 @@ unreachable instead. A mirror that passes is still real and usable, but
 ranked below every clean mirror rather than on equal footing.
 
 `marker-unknown` means the release metadata was readable but the archive root
-could not be listed, commonly because directory listing is disabled with a 403
-or 404 response. aptmir therefore cannot confirm whether a sync marker exists.
-The mirror remains usable, but is demoted below mirrors whose marker checks
-succeeded; unlike a mirror with a confirmed marker, it cannot be index-verified
-because there is no marker filename to inspect.
+could not be listed, commonly because directory listing is disabled and the
+root answers 403 or 404, though a timeout or a reset reads the same way.
+aptmir therefore cannot confirm whether a sync marker exists. The mirror
+remains usable and is demoted, sharing the one demoted tier with `syncing` and
+`stale-lock` mirrors rather than sitting below them. Its indexes are not
+verified either: verification is what a marker triggers, and here no marker was
+seen to trigger it. A marker that was seen but could not be confirmed, because
+the confirming request failed rather than came back empty, is reported as
+`stale-lock` and verified like any other lock of unreadable age.
 
 Ranking is by throughput among mirrors that are reachable and no staler than
 `-max-age` (24 h by default), with clean mirrors ranked ahead of `syncing`,
