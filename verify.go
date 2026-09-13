@@ -31,13 +31,15 @@ const staleAfter = time.Hour
 // fetched at all.
 const maxIndexBytes = 64 << 20
 
-// markerState describes the Archive-Update-in-Progress lock on a mirror.
+// markerState describes the result of checking for the
+// Archive-Update-in-Progress lock on a mirror.
 type markerState int
 
 const (
-	markerNone  markerState = iota // No lock file present.
-	markerFresh                    // Lock present and recent: a sync is running now.
-	markerStale                    // Lock present but old, or its age is unknown.
+	markerNone    markerState = iota // No lock file present.
+	markerFresh                      // Lock present and recent: a sync is running now.
+	markerStale                      // Lock present but old, or its age is unknown.
+	markerUnknown                    // The mirror's root could not be checked.
 )
 
 // String renders the state for the status column and JSON output.
@@ -47,6 +49,8 @@ func (s markerState) String() string {
 		return "syncing"
 	case markerStale:
 		return "stale-lock"
+	case markerUnknown:
+		return "marker-unknown"
 	default:
 		return ""
 	}
