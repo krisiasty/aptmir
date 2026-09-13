@@ -1,8 +1,11 @@
 // Command aptmir ranks Ubuntu archive mirrors by measured freshness and
-// throughput, and can rewrite the local apt sources to use the best one.
+// throughput and reports what it found. It does not change the system and has
+// no write path: nothing it prints takes effect until you edit your apt
+// sources yourself.
 //
-// It understands both the legacy one-line sources format and the deb822
-// format that Ubuntu adopted as the default in 24.04, so it works on 22.04
+// Autodetection reads /etc/os-release for the release codename and runs dpkg
+// for the architecture, both read-only and both replaceable with -codename and
+// -arch. Every other input is a network fetch, so the tool works on 22.04
 // through 26.04 and later without special-casing individual releases.
 package main
 
@@ -564,19 +567,15 @@ func detectCodename() (string, error) {
 
 func codenameFromOSRelease(path string) string {
 	//nolint:gosec // G304: the caller passes a fixed system path; tests pass their own.
-	f, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}
-	defer func() { _ = f.Close() }()
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		// os-release permits either quoting style around a value, and the file
 		// is edited by hand often enough that stray whitespace and CRLF line
-		// endings both turn up. A read error needs no separate branch: with no
-		// other detector left, an unreadable file and an absent key are the
-		// same answer.
-		after, ok := strings.CutPrefix(strings.TrimSpace(sc.Text()), "VERSION_CODENAME=")
+		// endings both turn up.
+		after, ok := strings.CutPrefix(strings.TrimSpace(line), "VERSION_CODENAME=")
 		if !ok {
 			continue
 		}

@@ -1,16 +1,16 @@
 # aptmir
 
 Ranks Ubuntu archive mirrors by measured freshness and throughput, and reports
-what it found. It covers the ranking half of `apt-smart` and understands the
-deb822 sources format Ubuntu has shipped by default since 24.04, so it works on
-22.04 through 26.04 and later. Changing your sources is left to you.
+what it found. It covers the ranking half of `apt-smart`, and works on 22.04
+through 26.04 and later without special-casing individual releases. Changing
+your sources is left to you.
 
 Standard library only — no dependencies, nothing to break.
 
 ## Platforms
 
-Linux is the target: the tool reads `/etc/os-release` and `/etc/apt`, and shells
-out to `dpkg` and `lsb_release`. Releases also carry macOS binaries for
+Linux is the target: the tool reads `/etc/os-release` and shells out to `dpkg`.
+Releases also carry macOS binaries for
 development convenience, where autodetection cannot work and `-codename` and
 `-arch` have to be given explicitly. Windows is not built, having none of the
 above.
@@ -401,10 +401,14 @@ for `BANDWIDTH` higher is.
 
 ## Safety
 
-aptmir does not modify your system. It has no write path: it reads
-`/etc/apt` only to detect your release codename, and everything else it
-touches is a network fetch. Nothing it prints takes effect until you edit
-your sources yourself.
+aptmir does not modify your system. It has no write path at all.
+
+What it does locally is autodetection, and only that: it reads
+`/etc/os-release` for your release codename and runs `dpkg --print-architecture`
+for your architecture. Both are read-only, and `-codename` and `-arch` replace
+them, which is what the macOS builds rely on. `/etc/apt` is not read. Everything
+else the tool touches is a network fetch, and nothing it prints takes effect
+until you edit your sources yourself.
 
 Probes refuse to connect to a non-public address. Loopback, private, link-local,
 carrier-grade NAT, unspecified and multicast destinations are rejected at the

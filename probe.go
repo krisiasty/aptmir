@@ -105,16 +105,17 @@ func responseTime(ctx context.Context, client *http.Client, cfg *config, base st
 	// The target depends on which path is being measured, and the two pull in
 	// opposite directions.
 	//
-	// By default we want the cold path a single machine pays, so we probe the
-	// detached Release file: it has no extension, so a front end caching by
-	// extension leaves it alone, and a unique query gives a distinct cache key
-	// even where that rule does not apply. Measured on a Cloudflare-fronted
-	// mirror, Release comes back DYNAMIC every time — never cached.
+	// By default we want the warm path repeated use sees, which needs a target
+	// the edge will actually serve from cache. The detached Release file cannot
+	// do that however we request it, so the probe uses Packages.gz: on a
+	// Cloudflare-fronted mirror that returns HIT at 53-63 ms, against 255-681 ms
+	// for Release.
 	//
-	// Under -allow-caching we want the warm path a fleet sees, which needs a
-	// target the edge will actually serve from cache. Release cannot do that
-	// however we request it, so the probe moves to Packages.gz: on the same
-	// mirror that returns HIT at 53-63 ms against 255-681 ms for Release.
+	// Under -no-cache we want the cold path a single machine pays, so the probe
+	// moves to Release: it has no extension, so a front end caching by extension
+	// leaves it alone, and a unique query gives a distinct cache key even where
+	// that rule does not apply. Measured on the same mirror, Release comes back
+	// DYNAMIC every time — never cached.
 	u := base + "dists/" + cfg.codename + "/Release"
 	if cfg.cachingAllowed() {
 		u = base + "dists/" + cfg.codename + "/main/binary-" + cfg.arch + "/Packages.gz"
@@ -578,12 +579,12 @@ func measureBandwidth(ctx context.Context, client *http.Client, cfg *config, bas
 
 	var lastErr error
 	for _, target := range targets {
-		// Under -allow-caching the figure that matters is the warm one a fleet
-		// sees, so prime the edge first and measure the second fetch. Without
-		// this the flag would relax the sweep and then still report the cold
-		// path here, so a CDN-fronted mirror would lose anyway and the flag
-		// would look broken. Measured on one such mirror: 5.6 MB/s cold,
-		// 43-51 MB/s warm.
+		// Unless -no-cache is given, the figure that matters is the warm one a
+		// fleet sees, so prime the edge first and measure the second fetch.
+		// Without this, caching would relax the sweep and then still report the
+		// cold path here, so a CDN-fronted mirror would lose anyway and the
+		// default would look broken. Measured on one such mirror: 5.6 MB/s
+		// cold, 43-51 MB/s warm.
 		if cfg.cachingAllowed() {
 			_, _, _ = timedPull(ctx, client, cfg, target.url)
 		}
