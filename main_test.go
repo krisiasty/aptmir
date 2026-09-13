@@ -453,7 +453,7 @@ func TestFetchLaunchpadMirrorsOutlastsTheBaseTimeout(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	got, err := fetchLaunchpadMirrors(t.Context(), newClient(timeout), srv.URL, timeout)
+	got, err := fetchLaunchpadMirrors(t.Context(), newTestClient(timeout), srv.URL, timeout)
 	if err != nil {
 		t.Fatalf("fetch: %v; the listing body must get launchpadBudget (%v), not the base timeout (%v)",
 			err, launchpadBudget(timeout), timeout)
@@ -1071,5 +1071,31 @@ func TestDefaultsMatchTheDocumentedOnes(t *testing.T) {
 		if c.got != c.want {
 			t.Errorf("%s default = %v, want %v", c.name, c.got, c.want)
 		}
+	}
+}
+
+// A mirror's own release file names the index paths, and a verification failure
+// puts one of those paths in the STATUS column. That text is written by whoever
+// runs the mirror, so it reaches the terminal only after the characters that
+// could drive it are removed: an escape sequence could recolour or erase the
+// rest of the table, and a newline could forge an extra row.
+func TestPrintTableStripsControlCharactersFromMirrorText(t *testing.T) {
+	hostile := "index verification failed: \x1b[2Kdists/\nnoble/fake\x07 ok"
+	_, rows := tableRows(t, []*Mirror{
+		{URL: "http://mirror.example/ubuntu/", Err: hostile},
+	})
+	row := rows[0]
+	for _, bad := range []string{"\x1b", "\x07"} {
+		if strings.Contains(row, bad) {
+			t.Errorf("row kept control character %q: %q", bad, row)
+		}
+	}
+	// tableRows already fails if the newline forged a second row, but say why.
+	if strings.Contains(row, "\n") {
+		t.Errorf("row kept a newline: %q", row)
+	}
+	// The diagnostic itself must survive: stripping is not censoring.
+	if !strings.Contains(row, "dists/") || !strings.Contains(row, "noble/fake") {
+		t.Errorf("row lost the diagnostic text: %q", row)
 	}
 }

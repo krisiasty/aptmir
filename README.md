@@ -132,6 +132,18 @@ Combining the two sources is worthwhile: for Germany the geo list offers 42
 candidates and Launchpad adds 16 more, including the `http` form of mirrors the
 geo list publishes only over `https`.
 
+There are exactly four sources of candidates, and none of them is you: the geo
+list, the Launchpad listing, the cloud-provider table behind `-include-csp`, and
+the canonical archive. No flag takes a URL, so there is no way to point aptmir at
+a mirror of your own choosing, including one on your own network.
+
+Of those four, only the geo list is fetched over plaintext HTTP.
+`mirrors.ubuntu.com` publishes no HTTPS endpoint at all, so there is nothing
+better to prefer; the Launchpad listing is fetched over HTTPS. An attacker on the
+path to the geo service can therefore add a candidate, which is the reason the
+`Safety` section below is worth reading before you paste a result into your
+sources.
+
 `-scheme` narrows the candidates further to `http` or `https` only. The default,
 `any`, keeps both. Note that a mirror often appears under only one of the two, so
 restricting the scheme can shrink the candidate pool noticeably, and `-scheme
@@ -393,6 +405,31 @@ aptmir does not modify your system. It has no write path: it reads
 `/etc/apt` only to detect your release codename, and everything else it
 touches is a network fetch. Nothing it prints takes effect until you edit
 your sources yourself.
+
+Probes refuse to connect to a non-public address. Loopback, private, link-local,
+carrier-grade NAT, unspecified and multicast destinations are rejected at the
+moment the connection is dialled, which covers a literal address in the
+catalogue, a listed mirror whose name resolves inside your network, and every
+redirect hop along the way. This is defence in depth rather than a patched hole:
+what would otherwise reach such an address is an unauthenticated `GET` or `HEAD`
+carrying no credentials, with no query string, whose body is read to a bounded
+limit and discarded. It exists mainly because a mirror resolving to a private
+address needs no attacker to happen — split-horizon DNS or a
+wildcard-redirecting resolver produces it by accident.
+
+What the guard does not address is the larger risk, because that one needs no
+private address at all. An attacker on the path to the plaintext geo list can
+inject a mirror they control on an ordinary public address, and it will be
+ranked like any other. apt verifies archive signatures, so such a mirror cannot
+inject packages into your system; what it can do is serve a genuine but older
+signed archive indefinitely, holding back security updates. aptmir's freshness
+column is what makes that visible — `BEHIND` is worth reading, not just
+`BANDWIDTH`.
+
+Text that a mirror chose is stripped of control characters before it is printed.
+The `STATUS` column quotes index paths from the mirror's own release file when
+verification fails, and an escape sequence there would otherwise be able to
+rewrite the table around it.
 
 Earlier versions shipped an `-apply` flag that rewrote `/etc/apt` to the
 winning mirror. It was removed: ranking depends on live latency and

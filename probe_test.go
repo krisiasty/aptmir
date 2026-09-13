@@ -42,7 +42,7 @@ func TestNewClientBoundsResponseBody(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
-	resp, err := newClient(timeout).Do(req)
+	resp, err := newTestClient(timeout).Do(req)
 	if err != nil {
 		t.Fatalf("request headers: %v", err)
 	}
@@ -221,7 +221,7 @@ func TestScreenUsesExtendedBodyBudget(t *testing.T) {
 
 	cfg := &config{codename: "noble", arch: "amd64", timeout: timeout, maxAge: time.Hour}
 	m := &Mirror{URL: srv.URL + "/"}
-	screen(t.Context(), newClient(timeout), cfg, m)
+	screen(t.Context(), newTestClient(timeout), cfg, m)
 	if m.Err != "" || !m.Reachable {
 		t.Errorf("screen rejected a body inside its extended budget: %+v", m)
 	}
@@ -400,7 +400,7 @@ func TestTimedPullUsesBandwidthBudget(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	cfg := &config{probeBytes: probeBytes, probeTime: time.Second, timeout: timeout}
-	bw, low, err := timedPull(t.Context(), newClient(timeout), cfg, srv.URL)
+	bw, low, err := timedPull(t.Context(), newTestClient(timeout), cfg, srv.URL)
 	if err != nil {
 		t.Fatalf("timedPull: %v", err)
 	}

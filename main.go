@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -27,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -355,9 +357,78 @@ func applyBehind(mirrors []*Mirror, reference time.Time) {
 	}
 }
 
+// cgnat is the carrier-grade NAT range. netip's IsPrivate covers RFC 1918 and
+// fc00::/7 but not this, and it is where a provider puts subscriber equipment.
+var cgnat = netip.MustParsePrefix("100.64.0.0/10")
+
+// publicOnlyAddr reports whether an address is one a public Ubuntu mirror could
+// plausibly answer from.
+//
+// Every candidate aptmir probes comes from a fixed source: the geo list, the
+// Launchpad listing, the cloud-provider table, or the canonical archive. No
+// flag accepts a URL, so a non-public destination can only arrive by way of a
+// tampered geo list, a compromised catalogue, or a listed mirror whose DNS
+// resolves inside the network. The last of those needs no attacker at all —
+// split-horizon DNS, a corporate resolver, or a wildcard-redirecting ISP
+// resolver produces it by accident.
+//
+// This guard is defence in depth rather than a fix for a live hole, and the
+// distinction is worth recording so nobody later mistakes it for one. What
+// reaches such a destination is an unauthenticated GET or HEAD carrying no
+// credentials, with the query string stripped and the path forced to end in a
+// slash, whose body is read to a bounded limit and discarded. Nothing derived
+// from it is written to disk or executed, and the results are printed to the
+// local terminal, so an attacker who induced the request sees nothing of the
+// answer. The serious risk in this area is a different one the guard does not
+// address: the geo list is fetched over plaintext HTTP, and an on-path attacker
+// can inject a mirror on an ordinary public address, which apt's signature
+// checking bounds to withholding updates rather than injecting packages.
+func publicOnlyAddr(addr netip.Addr) error {
+	addr = addr.Unmap()
+	public := addr.IsValid() &&
+		!addr.IsLoopback() && !addr.IsPrivate() && !addr.IsUnspecified() &&
+		!addr.IsLinkLocalUnicast() && !addr.IsMulticast() && !cgnat.Contains(addr)
+	if !public {
+		return fmt.Errorf("refusing to connect to a non-public address %v", addr)
+	}
+	return nil
+}
+
+// publicOnlyControl is the dialer hook that applies publicOnlyAddr.
+//
+// A Control hook is the only place this check is correct. It runs once per
+// connection, after resolution, on the literal address about to be dialled, so
+// one hook covers a literal IP in the catalogue, a hostname that resolves to a
+// non-public address, and every redirect hop — each hop opens its own
+// connection. It also leaves no window for a DNS rebind, because there is no
+// separate resolve-then-check to race.
+func publicOnlyControl(_, address string, _ syscall.RawConn) error {
+	ap, err := netip.ParseAddrPort(address)
+	if err != nil {
+		// The hook is handed an already-resolved literal, so this cannot
+		// normally happen. Refuse rather than let an unparsable address
+		// through unchecked.
+		return fmt.Errorf("refusing to connect to a non-public address %q", address)
+	}
+	return publicOnlyAddr(ap.Addr())
+}
+
+// newClient builds the client every probe uses, refusing non-public
+// destinations. See publicOnlyAddr for what that guard is and is not for.
 func newClient(timeout time.Duration) *http.Client {
+	return newClientWithControl(timeout, publicOnlyControl)
+}
+
+// newClientWithControl holds the transport settings the whole tool depends on,
+// with the address policy left to the caller. A nil control dials anything,
+// which is what the tests need: they serve from loopback, exactly what the
+// production policy exists to refuse.
+func newClientWithControl(timeout time.Duration, control func(network, address string, c syscall.RawConn) error) *http.Client {
 	tr := &http.Transport{
-		DialContext:           (&net.Dialer{Timeout: timeout}).DialContext,
+		DialContext: (&net.Dialer{
+			Timeout: timeout,
+			Control: control,
+		}).DialContext,
 		TLSHandshakeTimeout:   timeout,
 		ResponseHeaderTimeout: timeout,
 		MaxIdleConnsPerHost:   2,
@@ -1296,13 +1367,14 @@ func printTable(w io.Writer, mirrors []*Mirror) {
 		if m.LowConfidence {
 			status += " (low-confidence)"
 		}
+		// Both cells can carry text the mirror chose; see sanitizeCell.
 		_, _ = fmt.Fprintf(w, "%-4d %-52s %10s %9s %10s  %s\n",
 			i+1,
-			truncate(m.URL, 52),
+			sanitizeCell(truncate(m.URL, 52)),
 			formatRate(m.Bandwidth),
 			formatDuration(m.Response),
 			formatBehind(m),
-			status,
+			sanitizeCell(status),
 		)
 	}
 }
@@ -1398,6 +1470,35 @@ func printSummary(w io.Writer, mirrors []*Mirror) {
 			formatRate(bs.p90), formatRate(bs.p95), formatRate(bs.max),
 			strconv.Itoa(bs.n))
 	}
+}
+
+// sanitizeCell makes a string written by a mirror safe to print in a table
+// cell. Everything in the MIRROR and STATUS columns can originate with the
+// mirror: the URL comes from the catalogue, and a verification failure quotes
+// the index path the mirror's own release file declares.
+//
+// Control characters are the problem. An escape sequence can recolour, erase
+// or rewrite the rest of the table, a newline can forge a row that looks like
+// another mirror, and a bidi override can reverse the apparent spelling of a
+// host. Each is replaced with a question mark rather than dropped, so the row
+// still shows that something was there. Invalid UTF-8 goes the same way, which
+// also covers a multi-byte rune that truncate split.
+//
+// Only the table needs this. -json is escaped by encoding/json, and -debug
+// goes through slog, which quotes a value that needs it.
+func sanitizeCell(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r < 0x20, r == 0x7f, r >= 0x80 && r <= 0x9f:
+			// C0 controls, DEL and the C1 block.
+			return '?'
+		case r >= 0x202a && r <= 0x202e, r >= 0x2066 && r <= 0x2069,
+			r == 0x200e, r == 0x200f:
+			// Bidirectional embedding, override and isolate controls.
+			return '?'
+		}
+		return r
+	}, strings.ToValidUTF8(s, "?"))
 }
 
 func truncate(s string, n int) string {
