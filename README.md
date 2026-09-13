@@ -1,16 +1,16 @@
 # aptmir
 
-Ranks Ubuntu archive mirrors by measured freshness and throughput, and
-optionally rewrites your apt sources to use the best one. A replacement for
-`apt-smart` that understands the deb822 sources format Ubuntu has shipped by
-default since 24.04, so it works on 22.04 through 26.04 and later.
+Ranks Ubuntu archive mirrors by measured freshness and throughput, and reports
+what it found. It covers the ranking half of `apt-smart` and understands the
+deb822 sources format Ubuntu has shipped by default since 24.04, so it works on
+22.04 through 26.04 and later. Changing your sources is left to you.
 
 Standard library only — no dependencies, nothing to break.
 
 ## Platforms
 
-Linux is the target: the tool reads `/etc/os-release`, shells out to `dpkg` and
-`lsb_release`, and rewrites `/etc/apt`. Releases also carry macOS binaries for
+Linux is the target: the tool reads `/etc/os-release` and `/etc/apt`, and shells
+out to `dpkg` and `lsb_release`. Releases also carry macOS binaries for
 development convenience, where autodetection cannot work and `-codename` and
 `-arch` have to be given explicitly. Windows is not built, having none of the
 above.
@@ -28,13 +28,13 @@ brew install --cask krisiasty/tap/aptmir
 
 ## Usage
 
-Rank mirrors, change nothing:
+Rank mirrors:
 
 ```sh
 aptmir
 ```
 
-Restrict to a specific countries and probe more candidates:
+Restrict to specific countries:
 
 ```sh
 aptmir -country pl,de
@@ -46,13 +46,8 @@ Measure the cold path using only mirrors published over HTTP:
 aptmir -no-cache -scheme http
 ```
 
-Preview the change to your sources, then apply it:
-
-```sh
-sudo aptmir -apply -dry-run
-sudo aptmir -apply
-sudo apt update
-```
+aptmir never writes to your system. It reports; changing `/etc/apt` is
+your decision and your edit, so it needs no root and no `sudo`.
 
 Run `aptmir --help` for the full list of options.
 
@@ -328,7 +323,7 @@ For each candidate mirror, the table reports:
 | `BANDWIDTH` | Sustained bytes per second measured over `-probe-bytes` worth of data, after discarding a fixed warm-up. |
 | `RESPONSE` | Fastest of three time-to-first-byte probes. This is what decides which candidates are screened at all. |
 | `BEHIND` | Hours between this mirror's `InRelease` `Date:` field and the official archive's. Measured directly, not read off a status page. |
-| `STATUS` | `syncing` when the `Archive-Update-in-Progress` marker is present and confirmed recent — the mirror is mid-rsync, so its tree can change under a reader even though it answers. It is still ranked and shown, demoted below every clean mirror, but `-apply` never writes it to your sources. `stale-lock` when that marker is present but older than an hour, or its age could not be read at all — see below. Otherwise `ok`, or the error that made the mirror unusable. Suffixed `(low-confidence)` when the bandwidth figure came from the smaller `Packages.gz` index, or from a transfer too short to measure past the warm-up. |
+| `STATUS` | `syncing` when the `Archive-Update-in-Progress` marker is present and confirmed recent — the mirror is mid-rsync, so its tree can change under a reader even though it answers. It is still ranked and shown, demoted below every clean mirror. `stale-lock` when that marker is present but older than an hour, or its age could not be read at all — see below. Otherwise `ok`, or the error that made the mirror unusable. Suffixed `(low-confidence)` when the bandwidth figure came from the smaller `Packages.gz` index, or from a transfer too short to measure past the warm-up. |
 
 A `stale-lock` mirror carries a sync marker that is either older than an hour
 or whose age could not be determined at all: a marker whose `Last-Modified`
@@ -344,10 +339,9 @@ ranked below every clean mirror rather than on equal footing.
 Ranking is by throughput among mirrors that are reachable and no staler than
 `-max-age` (24 h by default), with clean mirrors ranked ahead of `syncing` and
 `stale-lock` ones that passed verification. Ranking demotes a locked mirror
-rather than hiding it; `-apply` is stricter, and refuses one that is actively
-syncing outright. Latency and bandwidth are close to uncorrelated for mirrors:
-a nearby host on a saturated uplink loses to a more distant one behind a CDN,
-which is why bandwidth leads.
+rather than hiding it. Latency and bandwidth are close to uncorrelated for
+mirrors: a nearby host on a saturated uplink loses to a more distant one behind
+a CDN, which is why bandwidth leads.
 
 Every measurement is a single snapshot on one network path. A mirror that
 benchmarks well at 03:00 may be congested at 19:00.
@@ -377,28 +371,17 @@ for `BANDWIDTH` higher is.
 
 ## Safety
 
-`-apply` only rewrites URIs pointing at the Ubuntu archive. It leaves alone:
+aptmir does not modify your system. It has no write path: it reads
+`/etc/apt` only to detect your release codename, and everything else it
+touches is a network fetch. Nothing it prints takes effect until you edit
+your sources yourself.
 
-- `security.ubuntu.com` (override with `-include-security`, not recommended —
-  you want security updates from the canonical source)
-- PPAs and any third-party repository
-- commented-out lines
-
-Each modified file is backed up alongside the original as
-`<file>.aptmir-<timestamp>` before anything is written. The rewrite is
-idempotent, so running it twice is harmless.
-
-`-apply` will not choose a `stale-lock` mirror unless no clean mirror
-qualifies at all, and it prints a warning to stderr on the run it does — it
-never falls back silently.
-
-`-apply` never chooses a `syncing` mirror, not even as a last resort. A lock
-younger than an hour means the tree is being rewritten right now, so verifying
-it proves something only for the instant the check ran — which is not enough to
-justify a persistent change to `/etc/apt`. A leaked (`stale-lock`) mirror is
-different: its tree is static, so a passing verification still means something
-afterwards, which is why that one remains available as a reported fallback. If
-nothing acceptable is left, `-apply` fails with an error and writes nothing.
+Earlier versions shipped an `-apply` flag that rewrote `/etc/apt` to the
+winning mirror. It was removed: ranking depends on live latency and
+throughput samples, so two runs minutes apart can legitimately disagree, and
+wiring a nondeterministic measurement to a persistent change of system files
+is not a trade worth making. Treat the table as a recommendation and make the
+change deliberately.
 
 ## Notes on releases
 
@@ -408,14 +391,14 @@ nothing acceptable is left, `-apply` fails with an error and writes nothing.
   repo such as NodeSource (`Suites: nodistro`) cannot be mistaken for the
   release.
 - Both `/etc/apt/sources.list` (legacy one-line) and
-  `/etc/apt/sources.list.d/*.sources` (deb822) are parsed and rewritten, so no
-  release-specific handling is needed as new versions land.
+  `/etc/apt/sources.list.d/*.sources` (deb822) are parsed, so no release-specific
+  handling is needed as new versions land.
 - If the release is end-of-life, the tool detects that the archive no longer
   carries it and points you at `old-releases.ubuntu.com` rather than ranking
   mirrors that cannot serve you.
 - On arm64/ppc64el/s390x/riscv64 it uses `ports.ubuntu.com`. Since
   `mirrors.ubuntu.com` only indexes the main archive, Launchpad is the only
-  those architectures to pull a wider candidate list.
+  source of a wider candidate list for those architectures.
 
 ## Flags
 
@@ -436,9 +419,6 @@ nothing acceptable is left, `-apply` fails with an error and writes nothing.
 -probe-time duration max duration per bandwidth probe (default 4s)
 -no-bandwidth        skip throughput probes, rank on latency
 -json                emit JSON instead of a table
--apply               rewrite apt sources to the winning mirror
--dry-run             with -apply, show the result without writing
--include-security    also redirect security.ubuntu.com entries
 -d, -debug           trace every request, result and measurement on stderr
 -v, -version         print version information and exit
 ```
@@ -455,7 +435,6 @@ cases — so the suite needs no network and touches no real mirror.
 
 | Area | What is covered |
 | --- | --- |
-| Sources rewriting | deb822 and legacy formats, `security.ubuntu.com` and PPA preservation, idempotency, and that a rewrite lands by atomic rename rather than in place |
 | Release detection | suite parsing, `Date:` field parsing, codename detection inputs |
 | Sync markers | absent, fresh, and stale markers; a pool that flaps per request and one that flaps per connection, which is how a real load-balanced host behaves |
 | Index verification | a good mirror, a corrupt index, a mirror publishing only `Release`, an index declaring an implausible size, a declared index the mirror does not serve, and a mirror that streams a body forever |
@@ -463,7 +442,7 @@ cases — so the suite needs no network and touches no real mirror.
 | Caching | cache-busting by default and a cacheable target under `-no-cache`'s inverse, CDN detection across Cloudflare, Fastly, Varnish and CloudFront headers, and the bandwidth phase priming before it times |
 | Candidate discovery | architecture filtering of ports versus main-archive URLs, `-scheme` filtering, `-country` list parsing, Launchpad link extraction against real URL shapes, the ISO country table, and the cloud provider archives including their exclusion on ports |
 | Rotations | `archive.ubuntu.com` and its relatives recognised as pools, a single-server mirror serving from a path containing `archive.ubuntu.com` not mistaken for one |
-| Ranking and `-apply` | clean mirrors above demoted ones, `-apply` preferring a clean mirror, falling back to a verified stale lock, and never selecting a syncing one |
+| Ranking | clean mirrors above demoted ones |
 | Staleness | the freshest evidence winning over a lagging pool backend, and a forged future date disregarded |
 | Flags | `-concurrency`, `-probe-bytes`, `-probe-time`, `-timeout`, `-probe-top`, `-screen-top`, `-limit`, `-scheme` and `-country` validation |
 | Errors | transport failures rendered short: TLS handshake timeout, connection refused, DNS failure, deadline |
