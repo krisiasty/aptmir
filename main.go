@@ -34,7 +34,6 @@ const (
 	defaultArchive   = "http://archive.ubuntu.com/ubuntu/"
 	defaultPorts     = "http://ports.ubuntu.com/ubuntu-ports/"
 	oldReleases      = "http://old-releases.ubuntu.com/ubuntu/"
-	securityHost     = "security.ubuntu.com"
 	geoMirrorList    = "http://mirrors.ubuntu.com/mirrors.txt"
 	countryMirrorFmt = "http://mirrors.ubuntu.com/%s.txt"
 	launchpadMirrors = "https://launchpad.net/ubuntu/+archivemirrors"
@@ -49,27 +48,24 @@ var portsArches = map[string]bool{
 }
 
 type config struct {
-	codename        string
-	arch            string
-	country         string
-	concurrency     int
-	timeout         time.Duration
-	probeBytes      int64
-	probeTime       time.Duration
-	maxAge          time.Duration
-	limit           int
-	probeTop        int
-	screenTop       int
-	noCache         bool
-	includeCSP      bool
-	showVersion     bool
-	scheme          string
-	skipBandwidth   bool
-	jsonOut         bool
-	apply           bool
-	dryRun          bool
-	includeSecurity bool
-	debug           bool
+	codename      string
+	arch          string
+	country       string
+	concurrency   int
+	timeout       time.Duration
+	probeBytes    int64
+	probeTime     time.Duration
+	maxAge        time.Duration
+	limit         int
+	probeTop      int
+	screenTop     int
+	noCache       bool
+	includeCSP    bool
+	showVersion   bool
+	scheme        string
+	skipBandwidth bool
+	jsonOut       bool
+	debug         bool
 }
 
 // Mirror holds everything measured about a single candidate.
@@ -95,7 +91,7 @@ type Mirror struct {
 // without error, published a release date, and is not staler than the
 // caller's tolerance. A mirror with a verified sync lock is still usable:
 // screen sets Demoted on it, and rank and measureTop tier on that flag rather
-// than excluding it here. -apply is stricter still; see selectForApply.
+// than excluding it here.
 func (m *Mirror) usable(maxAge time.Duration) bool {
 	if !m.Reachable || m.Err != "" {
 		return false
@@ -159,10 +155,6 @@ func registerFlags(fs *flag.FlagSet, cfg *config) {
 		"restrict candidates by URL scheme: http, https, or any")
 	fs.BoolVar(&cfg.skipBandwidth, "no-bandwidth", false, "skip throughput probes, rank on latency")
 	fs.BoolVar(&cfg.jsonOut, "json", false, "emit JSON instead of a table")
-	fs.BoolVar(&cfg.apply, "apply", false, "rewrite apt sources to the winning mirror")
-	fs.BoolVar(&cfg.dryRun, "dry-run", false, "with -apply, show the diff without writing")
-	fs.BoolVar(&cfg.includeSecurity, "include-security", false,
-		"also redirect security.ubuntu.com entries (not recommended)")
 	fs.BoolVar(&cfg.debug, "d", false, "trace every request, result and measurement on stderr")
 	fs.BoolVar(&cfg.debug, "debug", false,
 		"trace every request, result and measurement on stderr (same as -d)")
@@ -262,7 +254,7 @@ func run(ctx context.Context, cfg *config) error {
 
 	announce(fmt.Sprintf("discovering mirrors for %s/%s...", cfg.codename, cfg.arch),
 		"discovering mirrors", "codename", cfg.codename, "arch", cfg.arch)
-	candidates, knownArchives := discover(ctx, client, cfg)
+	candidates := discover(ctx, client, cfg)
 	if len(candidates) == 0 {
 		return errors.New("no candidate mirrors found")
 	}
@@ -311,46 +303,7 @@ func run(ctx context.Context, cfg *config) error {
 	printTable(os.Stdout, ranked)
 	printSummary(os.Stdout, ranked)
 
-	if !cfg.apply {
-		return nil
-	}
-	best, fellBack := selectForApply(ranked, cfg)
-	if best == nil {
-		return errors.New("no mirror met the freshness and availability criteria for -apply; " +
-			"mirrors that are mid-sync are never written to /etc/apt, even as a fallback. " +
-			"Nothing was changed")
-	}
-	if fellBack {
-		fmt.Fprintf(os.Stderr,
-			"no clean mirror qualified; falling back to %s, which carries a leaked\n"+
-				"         sync lock (older than an hour, or of unreadable age) whose tree passed\n"+
-				"         index verification against its own release file.\n", best.URL)
-	}
-	return applyMirror(cfg, best.URL, knownArchives)
-}
-
-// selectForApply picks the mirror to write into apt sources. Rewriting
-// sources is persistent, so a mirror whose sync lock leaked is used only
-// when no clean mirror qualifies, and the caller is told when that happened.
-func selectForApply(ranked []*Mirror, cfg *config) (*Mirror, bool) {
-	// A mirror whose lock is fresh is mid-rsync right now. Verification of such
-	// a tree is valid only for the instant it ran, because the tree is being
-	// rewritten underneath it — unlike a leaked lock, where the tree is static
-	// and a passing verification means something an hour later. Ranking and the
-	// table still show it, demoted; -apply writes /etc/apt persistently, so it
-	// never selects one, not even as a fallback.
-	acceptable := func(m *Mirror) bool { return m.usable(cfg.maxAge) && !m.Updating }
-	for _, m := range ranked {
-		if acceptable(m) && !m.Demoted {
-			return m, false
-		}
-	}
-	for _, m := range ranked {
-		if acceptable(m) {
-			return m, true
-		}
-	}
-	return nil, false
+	return nil
 }
 
 // maxClockSkew is how far past local time a release date may sit before it is
@@ -685,19 +638,13 @@ func (cfg *config) archiveRoot() string {
 
 // ---------------------------------------------------------------- discovery
 
-func discover(ctx context.Context, client *http.Client, cfg *config) ([]*Mirror, map[string]struct{}) {
+func discover(ctx context.Context, client *http.Client, cfg *config) []*Mirror {
 	seen := map[string]*Mirror{}
-	knownArchives := map[string]struct{}{}
 	add := func(raw, country string) {
 		raw = normalizeMirrorURL(raw)
 		if raw == "" {
 			return
 		}
-		// Every input to add came from an Ubuntu-operated mirror catalogue or
-		// from the built-in canonical/cloud-provider list. Keep that provenance
-		// even when the candidate is later filtered by architecture or scheme,
-		// so -apply can safely recognise an already-configured official mirror.
-		knownArchives[raw] = struct{}{}
 		// One gate for every source: the geo list, the canonical archive root
 		// and the Launchpad scrape, whose regexp matches ubuntu-ports too.
 		if !servesArch(raw, cfg.arch) || !schemeAllowed(raw, cfg.scheme) {
@@ -791,12 +738,6 @@ func discover(ctx context.Context, client *http.Client, cfg *config) ([]*Mirror,
 			want[code] = true
 		}
 		for _, m := range lp {
-			// Launchpad is fetched globally before -country narrows the ranking.
-			// Remember every official URL so a source using a mirror in another
-			// country can still be replaced without relying on hostname guesses.
-			if n := normalizeMirrorURL(m.URL); n != "" {
-				knownArchives[n] = struct{}{}
-			}
 			// -country narrows Launchpad too. Without this the flag is
 			// silently ignored whenever -launchpad is given, and a run asking
 			// for one country quietly widens to every mirror in the world.
@@ -819,7 +760,7 @@ func discover(ctx context.Context, client *http.Client, cfg *config) ([]*Mirror,
 			added[u] = true
 		}
 	}
-	return out, knownArchives
+	return out
 }
 
 // parseCountries splits the -country value into upper-case ISO 3166-1 alpha-2
@@ -1470,172 +1411,4 @@ func formatBehind(m *Mirror) string {
 		return "current"
 	}
 	return fmt.Sprintf("%.0f h", h)
-}
-
-// ---------------------------------------------------------------- apply
-
-func applyMirror(cfg *config, mirror string, knownArchives map[string]struct{}) error {
-	files, err := sourceFiles()
-	if err != nil {
-		return err
-	}
-	if len(files) == 0 {
-		return errors.New("found no apt source files to rewrite")
-	}
-	changed := 0
-	for _, path := range files {
-		info, err := os.Stat(path)
-		if err != nil {
-			return fmt.Errorf("stat %s: %w", path, err)
-		}
-		//nolint:gosec // G304: path comes from sourceFiles, a fixed set of /etc/apt globs.
-		orig, err := os.ReadFile(path)
-		if err != nil {
-			return fmt.Errorf("read %s: %w", path, err)
-		}
-		updated := rewriteSources(string(orig), mirror, cfg, knownArchives)
-		if updated == string(orig) {
-			continue
-		}
-		changed++
-		if cfg.dryRun {
-			fmt.Printf("\n--- %s (dry run)\n%s", path, updated)
-			continue
-		}
-		// The backup and the rewritten file keep whatever mode apt already
-		// had on the original; sources files are world-readable by convention.
-		mode := info.Mode().Perm()
-		backup := fmt.Sprintf("%s.aptmir-%s", path, time.Now().Format("20060102-150405"))
-		//nolint:gosec // G306: the backup keeps the original's own mode, whatever apt set.
-		if err := os.WriteFile(backup, orig, mode); err != nil {
-			return fmt.Errorf("backup %s: %w", path, err)
-		}
-		if err := writeFileAtomic(path, []byte(updated), mode); err != nil {
-			return fmt.Errorf("write %s: %w", path, err)
-		}
-		fmt.Printf("updated %s (backup at %s)\n", path, backup)
-	}
-	if changed == 0 {
-		fmt.Println("no changes needed")
-		return nil
-	}
-	if !cfg.dryRun {
-		fmt.Println("run 'sudo apt update' to pick up the new mirror")
-	}
-	return nil
-}
-
-// writeFileAtomic writes data to a temporary file in the target's own directory
-// and renames it over the target. This is the only destructive thing the tool
-// does and it targets /etc/apt: an in-place write that fails partway leaves a
-// truncated sources file, and a multi-file rewrite that fails on file three
-// leaves the machine with a mixed set. A rename is atomic on POSIX, so each
-// file is either its old contents or its new ones. The temporary name cannot
-// match apt's *.list or *.sources globs, so even a crash between the write and
-// the rename leaves nothing apt will read.
-func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
-	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".aptmir-tmp-")
-	if err != nil {
-		return err
-	}
-	tmp := f.Name()
-	// Removes the temporary file on every failure path; after a successful
-	// rename the name no longer exists and this is a no-op.
-	defer func() { _ = os.Remove(tmp) }()
-
-	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	// CreateTemp makes the file 0600; sources files are world-readable by
-	// convention, so restore whatever mode the original carried.
-	if err := os.Chmod(tmp, mode); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
-}
-
-func sourceFiles() ([]string, error) {
-	var out []string
-	if _, err := os.Stat("/etc/apt/sources.list"); err == nil {
-		out = append(out, "/etc/apt/sources.list")
-	}
-	for _, pattern := range []string{
-		"/etc/apt/sources.list.d/*.list",
-		"/etc/apt/sources.list.d/*.sources",
-	} {
-		found, err := filepath.Glob(pattern)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, found...)
-	}
-	return out, nil
-}
-
-// sourceURLRe finds URL tokens on deb and deb822 source lines. Whether a token
-// belongs to Ubuntu is decided from its parsed hostname or exact catalogue URL;
-// the regexp deliberately makes no trust decision of its own.
-var sourceURLRe = regexp.MustCompile(`https?://[^\s#]+`)
-
-// isCanonicalArchiveHost recognises Ubuntu-operated archive hostnames. Domain
-// boundaries are explicit: archive.ubuntu.com.example.org must not be treated
-// as an Ubuntu host merely because its name contains archive.ubuntu.com.
-func isCanonicalArchiveHost(host string) bool {
-	host = strings.ToLower(host)
-	return host == "archive.ubuntu.com" ||
-		host == "ports.ubuntu.com" ||
-		host == securityHost ||
-		host == "ubuntu.osuosl.org" ||
-		strings.HasSuffix(host, ".archive.ubuntu.com")
-}
-
-// shouldRewriteArchive reports whether raw is an Ubuntu archive root known
-// either by its canonical hostname or by exact membership in the official
-// mirror catalogues fetched during discovery.
-func shouldRewriteArchive(raw string, cfg *config, knownArchives map[string]struct{}) bool {
-	u, err := url.Parse(raw)
-	if err != nil || u.Host == "" {
-		return false
-	}
-	host := strings.ToLower(u.Hostname())
-	if host == securityHost && !cfg.includeSecurity {
-		return false
-	}
-	if isCanonicalArchiveHost(host) {
-		return true
-	}
-	normalized := normalizeMirrorURL(raw)
-	_, ok := knownArchives[normalized]
-	return ok
-}
-
-func rewriteSources(content, mirror string, cfg *config, knownArchives map[string]struct{}) string {
-	lines := strings.Split(content, "\n")
-	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-		lower := strings.ToLower(trimmed)
-		isURI := strings.HasPrefix(lower, "uris:")
-		isDeb := strings.HasPrefix(lower, "deb ") || strings.HasPrefix(lower, "deb-src ")
-		if !isURI && !isDeb {
-			continue
-		}
-		lines[i] = sourceURLRe.ReplaceAllStringFunc(line, func(match string) string {
-			if !shouldRewriteArchive(match, cfg, knownArchives) {
-				return match
-			}
-			return strings.TrimSuffix(mirror, "/")
-		})
-	}
-	return strings.Join(lines, "\n")
 }

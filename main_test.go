@@ -6,108 +6,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 )
-
-const mirror = "http://ftp.uni-stuttgart.de/ubuntu/"
-
-func TestRewriteDeb822(t *testing.T) {
-	in := `Types: deb
-URIs: http://archive.ubuntu.com/ubuntu/
-Suites: noble noble-updates noble-backports
-Components: main restricted universe multiverse
-Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
-
-Types: deb
-URIs: http://security.ubuntu.com/ubuntu/
-Suites: noble-security
-Components: main restricted universe multiverse
-`
-	out := rewriteSources(in, mirror, &config{}, nil)
-	if !strings.Contains(out, "URIs: http://ftp.uni-stuttgart.de/ubuntu") {
-		t.Errorf("archive URI was not redirected:\n%s", out)
-	}
-	if !strings.Contains(out, "URIs: http://security.ubuntu.com/ubuntu/") {
-		t.Errorf("security URI should be left alone:\n%s", out)
-	}
-	if !strings.Contains(out, "Suites: noble noble-updates noble-backports") {
-		t.Errorf("suites were disturbed:\n%s", out)
-	}
-}
-
-func TestRewriteLegacy(t *testing.T) {
-	in := `deb http://archive.ubuntu.com/ubuntu jammy main restricted
-deb-src http://archive.ubuntu.com/ubuntu jammy main restricted
-deb http://security.ubuntu.com/ubuntu jammy-security main
-deb http://ppa.launchpadcontent.net/git-core/ppa/ubuntu jammy main
-# deb http://archive.ubuntu.com/ubuntu jammy universe
-`
-	out := rewriteSources(in, mirror, &config{}, nil)
-	lines := strings.Split(out, "\n")
-
-	if !strings.HasPrefix(lines[0], "deb http://ftp.uni-stuttgart.de/ubuntu jammy") {
-		t.Errorf("deb line not rewritten: %q", lines[0])
-	}
-	if !strings.HasPrefix(lines[1], "deb-src http://ftp.uni-stuttgart.de/ubuntu jammy") {
-		t.Errorf("deb-src line not rewritten: %q", lines[1])
-	}
-	if !strings.Contains(lines[2], "security.ubuntu.com") {
-		t.Errorf("security line altered: %q", lines[2])
-	}
-	if !strings.Contains(lines[3], "ppa.launchpadcontent.net") {
-		t.Errorf("PPA line altered: %q", lines[3])
-	}
-	if !strings.HasPrefix(lines[4], "# deb http://archive.ubuntu.com") {
-		t.Errorf("comment altered: %q", lines[4])
-	}
-}
-
-func TestRewriteIncludeSecurity(t *testing.T) {
-	in := "deb http://security.ubuntu.com/ubuntu noble-security main\n"
-	out := rewriteSources(in, mirror, &config{includeSecurity: true}, nil)
-	if strings.Contains(out, "security.ubuntu.com") {
-		t.Errorf("security should have been redirected: %q", out)
-	}
-}
-
-func TestRewriteIdempotent(t *testing.T) {
-	in := "deb http://archive.ubuntu.com/ubuntu noble main\n"
-	once := rewriteSources(in, mirror, &config{}, nil)
-	twice := rewriteSources(once, mirror, &config{}, nil)
-	if once != twice {
-		t.Errorf("not idempotent:\n%q\n%q", once, twice)
-	}
-}
-
-func TestRewriteKnownCatalogueMirror(t *testing.T) {
-	const current = "https://ftp.uni-stuttgart.de/ubuntu/"
-	in := "deb " + current + " noble main restricted universe multiverse\n"
-	known := map[string]struct{}{current: {}}
-
-	out := rewriteSources(in, mirror, &config{}, known)
-	if strings.Contains(out, current) || !strings.Contains(out, mirror[:len(mirror)-1]) {
-		t.Errorf("catalogued Ubuntu mirror was not redirected: %q", out)
-	}
-}
-
-func TestRewriteDoesNotTrustUbuntuSubstringInHostname(t *testing.T) {
-	thirdParty := []string{
-		"https://notubuntu.com/repository/",
-		"https://archive.ubuntu.com.example.org/repository/",
-	}
-	for _, uri := range thirdParty {
-		in := "deb " + uri + " stable main\n"
-		if got := rewriteSources(in, mirror, &config{}, nil); got != in {
-			t.Errorf("third-party source %q was rewritten to %q", in, got)
-		}
-	}
-}
 
 func TestBaseSuite(t *testing.T) {
 	cases := map[string]string{
@@ -179,30 +82,6 @@ func TestRankPutsCleanMirrorsAboveDemoted(t *testing.T) {
 	got := rank([]*Mirror{demotedFast, cleanSlow}, cfg)
 	if got[0].URL != "http://c/" {
 		t.Errorf("ranked first = %s, want the clean mirror even though it is slower", got[0].URL)
-	}
-}
-
-func TestSelectForApplyPrefersCleanMirror(t *testing.T) {
-	cfg := &config{maxAge: 24 * time.Hour}
-	now := time.Now()
-	ranked := []*Mirror{
-		{URL: "http://c/", Reachable: true, Released: now, Bandwidth: 1e6},
-		{URL: "http://d/", Reachable: true, Released: now, Bandwidth: 9e6, Demoted: true},
-	}
-	best, fellBack := selectForApply(ranked, cfg)
-	if best.URL != "http://c/" || fellBack {
-		t.Errorf("selected %s fellBack=%v", best.URL, fellBack)
-	}
-}
-
-func TestSelectForApplyFallsBackAndReportsIt(t *testing.T) {
-	cfg := &config{maxAge: 24 * time.Hour}
-	ranked := []*Mirror{
-		{URL: "http://d/", Reachable: true, Released: time.Now(), Bandwidth: 9e6, Demoted: true},
-	}
-	best, fellBack := selectForApply(ranked, cfg)
-	if best == nil || !fellBack {
-		t.Errorf("best=%v fellBack=%v, want the demoted mirror with fellBack true", best, fellBack)
 	}
 }
 
@@ -314,54 +193,6 @@ func TestPrintTableLowConfidenceStaysAligned(t *testing.T) {
 	}
 }
 
-// TestSelectForApplyNeverSelectsSyncingMirror pins down the -apply rule: a
-// mirror whose sync lock is fresh is being rewritten right now, so verification
-// of its tree was true only for the instant it ran. Ranking still shows such a
-// mirror, demoted; -apply writes /etc/apt persistently and must refuse it even
-// when it is the only candidate left.
-func TestSelectForApplyNeverSelectsSyncingMirror(t *testing.T) {
-	cfg := &config{maxAge: 24 * time.Hour}
-	now := time.Now()
-	syncing := func() *Mirror {
-		return &Mirror{
-			URL: "http://s/", Reachable: true, Released: now, Bandwidth: 99e6,
-			Updating: true, MarkerStatus: "syncing", Verified: true, Demoted: true,
-		}
-	}
-
-	t.Run("alone", func(t *testing.T) {
-		best, fellBack := selectForApply([]*Mirror{syncing()}, cfg)
-		if best != nil {
-			t.Errorf("selected %s, want nil: -apply must never write a mirror that is mid-sync", best.URL)
-		}
-		if fellBack {
-			t.Error("fellBack = true, want false when nothing was selected")
-		}
-	})
-
-	t.Run("alongside a clean mirror", func(t *testing.T) {
-		clean := &Mirror{URL: "http://c/", Reachable: true, Released: now, Bandwidth: 1e6}
-		best, fellBack := selectForApply([]*Mirror{syncing(), clean}, cfg)
-		if best == nil || best.URL != "http://c/" {
-			t.Fatalf("selected %v, want the clean mirror", best)
-		}
-		if fellBack {
-			t.Error("fellBack = true, want false: a clean mirror qualified")
-		}
-	})
-
-	t.Run("stale lock is still a fallback", func(t *testing.T) {
-		stale := &Mirror{
-			URL: "http://d/", Reachable: true, Released: now, Bandwidth: 9e6,
-			MarkerStatus: "stale-lock", Verified: true, Demoted: true,
-		}
-		best, fellBack := selectForApply([]*Mirror{syncing(), stale}, cfg)
-		if best == nil || best.URL != "http://d/" || !fellBack {
-			t.Errorf("best=%v fellBack=%v, want the verified stale-lock mirror as a reported fallback", best, fellBack)
-		}
-	})
-}
-
 func TestValidateConfig(t *testing.T) {
 	valid := func() *config {
 		return &config{
@@ -438,67 +269,6 @@ func TestApplyBehind(t *testing.T) {
 	}
 	if unknown.Behind != 0 {
 		t.Errorf("Behind = %v, want 0 for a mirror with no release date", unknown.Behind)
-	}
-}
-
-// TestWriteFileAtomicReplacesByRename checks the property that makes the write
-// atomic rather than merely successful: the target is replaced by a rename, so
-// it gets a new inode, and a reader holding the old file never sees a partial
-// rewrite. An in-place os.WriteFile passes every other assertion here and fails
-// this one.
-func TestWriteFileAtomicReplacesByRename(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "ubuntu.sources")
-	//nolint:gosec // G306: 0644 is the mode apt itself uses for sources files, which is the point of the test.
-	if err := os.WriteFile(path, []byte("old\n"), 0o644); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-	before, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("stat: %v", err)
-	}
-
-	if err := writeFileAtomic(path, []byte("new\n"), 0o644); err != nil {
-		t.Fatalf("writeFileAtomic: %v", err)
-	}
-
-	//nolint:gosec // G304: path is this test's own t.TempDir file.
-	got, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read back: %v", err)
-	}
-	if string(got) != "new\n" {
-		t.Errorf("content = %q, want %q", got, "new\n")
-	}
-	after, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("stat after: %v", err)
-	}
-	if after.Mode().Perm() != 0o644 {
-		t.Errorf("mode = %v, want 0644 preserved", after.Mode().Perm())
-	}
-
-	oldStat, ok1 := before.Sys().(*syscall.Stat_t)
-	newStat, ok2 := after.Sys().(*syscall.Stat_t)
-	if !ok1 || !ok2 {
-		t.Skip("inode numbers unavailable on this platform")
-	}
-	if oldStat.Ino == newStat.Ino {
-		t.Errorf("inode unchanged (%d): the file was written in place, not renamed over", newStat.Ino)
-	}
-
-	// Nothing may be left behind, and in particular nothing matching apt's own
-	// *.sources / *.list globs.
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatalf("readdir: %v", err)
-	}
-	if len(entries) != 1 || entries[0].Name() != "ubuntu.sources" {
-		names := make([]string, 0, len(entries))
-		for _, e := range entries {
-			names = append(names, e.Name())
-		}
-		t.Errorf("directory contains %v, want only ubuntu.sources", names)
 	}
 }
 
