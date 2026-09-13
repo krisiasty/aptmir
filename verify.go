@@ -105,24 +105,24 @@ func detectMarker(ctx context.Context, client *http.Client, base string) (marker
 
 	debugLog.Debug("marker seen", "mirror", base, "marker", name, "confirming", true)
 	confirm, err := markerName(ctx, confirmClient, base)
+	ageClient := confirmClient
 	if err != nil {
 		// A confirmation that never answered is not an answer that the marker
-		// is gone. Discarding the sighting here would report a mirror that is
-		// genuinely mid-rsync as one whose root could not be checked at all,
-		// leaving it unverified and ranked as though nothing had been seen.
-		// Report the lock with an age that could not be read instead, which is
-		// what markerStale already means.
+		// is gone. Keep the sighting and try its Last-Modified through the
+		// original client, whose transport may reuse the connection that saw
+		// the marker. If that also fails, markerStale remains the conservative
+		// state for a lock whose age could not be read.
 		debugLog.Debug("marker unconfirmable", "mirror", base, "marker", name, "err", shortErr(err))
-		return markerInfo{State: markerStale, Name: name}, nil
-	}
-	if confirm == "" {
+		ageClient = client
+	} else if confirm == "" {
 		return markerInfo{Name: name, Unconfirmed: true}, nil
 	}
 
 	info := markerInfo{State: markerStale, Name: name}
-	// The age comes from the backend that confirmed the marker, over the
-	// connection that confirmation already opened.
-	mod, err := markerModified(ctx, confirmClient, base+name)
+	// After a successful confirmation the age comes from that backend. If the
+	// confirmation failed, the original client's idle connection is the best
+	// chance of reaching the backend that supplied the initial sighting.
+	mod, err := markerModified(ctx, ageClient, base+name)
 	if err == nil && !mod.IsZero() {
 		info.Modified = mod
 		if time.Since(mod) < staleAfter {
