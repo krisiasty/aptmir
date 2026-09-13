@@ -382,10 +382,13 @@ func screen(ctx context.Context, client *http.Client, cfg *config, m *Mirror) {
 
 	info, err := detectMarker(ctx, client, m.URL)
 	if err != nil {
-		// A root listing that answers 403 or 404 — common wherever autoindex is
-		// off — is indistinguishable from a clean root at this point, so the
-		// mirror silently skips the whole sync-lock feature. Say so rather than
-		// letting it look confirmed-clean.
+		// The archive root could not be read. A 403 or 404 is the common
+		// case, wherever autoindex is off, but a timeout or a reset root
+		// request reads the same way: all of them leave the sync-lock state
+		// unknown. Keep the mirror usable, but rank it below mirrors whose
+		// roots were checked successfully.
+		m.MarkerStatus = markerUnknown.String()
+		m.Demoted = true
 		debugLog.Debug("marker check failed", "mirror", m.URL, "err", shortErr(err))
 		return
 	}

@@ -31,13 +31,15 @@ const staleAfter = time.Hour
 // fetched at all.
 const maxIndexBytes = 64 << 20
 
-// markerState describes the Archive-Update-in-Progress lock on a mirror.
+// markerState describes the result of checking for the
+// Archive-Update-in-Progress lock on a mirror.
 type markerState int
 
 const (
-	markerNone  markerState = iota // No lock file present.
-	markerFresh                    // Lock present and recent: a sync is running now.
-	markerStale                    // Lock present but old, or its age is unknown.
+	markerNone    markerState = iota // No lock file present.
+	markerFresh                      // Lock present and recent: a sync is running now.
+	markerStale                      // Lock present but old, or its age is unknown.
+	markerUnknown                    // The mirror's root could not be checked.
 )
 
 // String renders the state for the status column and JSON output.
@@ -47,6 +49,8 @@ func (s markerState) String() string {
 		return "syncing"
 	case markerStale:
 		return "stale-lock"
+	case markerUnknown:
+		return "marker-unknown"
 	default:
 		return ""
 	}
@@ -101,17 +105,24 @@ func detectMarker(ctx context.Context, client *http.Client, base string) (marker
 
 	debugLog.Debug("marker seen", "mirror", base, "marker", name, "confirming", true)
 	confirm, err := markerName(ctx, confirmClient, base)
+	ageClient := confirmClient
 	if err != nil {
-		return markerInfo{}, err
-	}
-	if confirm == "" {
+		// A confirmation that never answered is not an answer that the marker
+		// is gone. Keep the sighting and try its Last-Modified through the
+		// original client, whose transport may reuse the connection that saw
+		// the marker. If that also fails, markerStale remains the conservative
+		// state for a lock whose age could not be read.
+		debugLog.Debug("marker unconfirmable", "mirror", base, "marker", name, "err", shortErr(err))
+		ageClient = client
+	} else if confirm == "" {
 		return markerInfo{Name: name, Unconfirmed: true}, nil
 	}
 
 	info := markerInfo{State: markerStale, Name: name}
-	// The age comes from the backend that confirmed the marker, over the
-	// connection that confirmation already opened.
-	mod, err := markerModified(ctx, confirmClient, base+name)
+	// After a successful confirmation the age comes from that backend. If the
+	// confirmation failed, the original client's idle connection is the best
+	// chance of reaching the backend that supplied the initial sighting.
+	mod, err := markerModified(ctx, ageClient, base+name)
 	if err == nil && !mod.IsZero() {
 		info.Modified = mod
 		if time.Since(mod) < staleAfter {

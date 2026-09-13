@@ -62,6 +62,108 @@ func TestDetectMarkerIgnoresFlapping(t *testing.T) {
 	}
 }
 
+// A confirmation that fails to answer is not an answer that the marker is
+// gone. Losing the sighting would report a mirror that is genuinely mid-rsync
+// as one whose root could not be checked, which skips index verification and
+// ranks it as though nothing had been seen.
+func TestDetectMarkerKeepsSightingWhenConfirmationFails(t *testing.T) {
+	const name = "Archive-Update-in-Progress-host-1"
+	var hits atomic.Int64
+	var headHits atomic.Int64
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			headHits.Add(1)
+		}
+		if hits.Add(1) > 1 {
+			// Drop the connection without a response: the confirming request,
+			// and the HEAD that would read the marker's age, both fail.
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Error("test server does not support hijacking")
+				return
+			}
+			conn, _, err := hj.Hijack()
+			if err != nil {
+				t.Errorf("hijack: %v", err)
+				return
+			}
+			_ = conn.Close()
+			return
+		}
+		_, _ = fmt.Fprintf(w, `<html><body><pre><a href="dists/">dists/</a>`+
+			`<a href="%s">%s</a></pre></body></html>`, name, name)
+	}))
+	t.Cleanup(srv.Close)
+
+	got, err := detectMarker(t.Context(), srv.Client(), srv.URL+"/")
+	if err != nil {
+		t.Fatalf("detectMarker: %v", err)
+	}
+	if got.State != markerStale {
+		t.Errorf("State = %v, want markerStale: a marker was seen and its age could not be read", got.State)
+	}
+	if got.Name != name {
+		t.Errorf("Name = %q, want %q: the sighting must name the file it saw", got.Name, name)
+	}
+	if headHits.Load() == 0 {
+		t.Error("marker age was not requested after confirmation failed")
+	}
+}
+
+// A failed confirmation must not force a recent marker into stale-lock when
+// the original connection can still provide its age. The first client has the
+// only connection that saw the marker, so the fallback HEAD must use it.
+func TestDetectMarkerReadsAgeFromSightingWhenConfirmationFails(t *testing.T) {
+	type connKey struct{}
+	const name = "Archive-Update-in-Progress-host-1"
+	var conns atomic.Int64
+	var headHits atomic.Int64
+
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id, _ := r.Context().Value(connKey{}).(int64)
+		switch {
+		case id == 1 && r.Method == http.MethodGet && r.URL.Path == "/":
+			_, _ = fmt.Fprintf(w, `<html><body><pre><a href="%s">%s</a></pre></body></html>`, name, name)
+		case id == 1 && r.Method == http.MethodHead && r.URL.Path == "/"+name:
+			headHits.Add(1)
+			w.Header().Set("Last-Modified", time.Now().Add(-time.Minute).UTC().Format(http.TimeFormat))
+			w.WriteHeader(http.StatusOK)
+		default:
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Error("test server does not support hijacking")
+				return
+			}
+			conn, _, err := hj.Hijack()
+			if err != nil {
+				t.Errorf("hijack: %v", err)
+				return
+			}
+			_ = conn.Close()
+		}
+	}))
+	srv.Config.ConnContext = func(ctx context.Context, _ net.Conn) context.Context {
+		return context.WithValue(ctx, connKey{}, conns.Add(1))
+	}
+	srv.Start()
+	t.Cleanup(srv.Close)
+
+	got, err := detectMarker(t.Context(), srv.Client(), srv.URL+"/")
+	if err != nil {
+		t.Fatalf("detectMarker: %v", err)
+	}
+	if got.State != markerFresh {
+		t.Errorf("State = %v, want markerFresh: the original connection supplied a recent age", got.State)
+	}
+	if got.Name != name {
+		t.Errorf("Name = %q, want %q", got.Name, name)
+	}
+	if headHits.Load() != 1 {
+		t.Errorf("marker HEAD requests on the original connection = %d, want 1", headHits.Load())
+	}
+}
+
 func TestParseInReleaseIndexes(t *testing.T) {
 	data := []byte("Origin: Ubuntu\nSHA256:\n" +
 		" aaaa 12 main/binary-amd64/Packages.gz\n" +

@@ -330,7 +330,7 @@ For each candidate mirror, the table reports:
 | `BANDWIDTH` | Sustained bytes per second measured over `-probe-bytes` worth of data, after discarding a fixed warm-up. |
 | `RESPONSE` | Fastest of three time-to-first-byte probes. This is what decides which candidates are screened at all. |
 | `BEHIND` | Hours between this mirror's `InRelease` `Date:` field and the official archive's. Measured directly, not read off a status page. |
-| `STATUS` | `syncing` when the `Archive-Update-in-Progress` marker is present and confirmed recent — the mirror is mid-rsync, so its tree can change under a reader even though it answers. It is still ranked and shown, demoted below every clean mirror. `stale-lock` when that marker is present but older than an hour, or its age could not be read at all — see below. Otherwise `ok`, or the error that made the mirror unusable. Suffixed `(low-confidence)` when the bandwidth figure came from the smaller `Packages.gz` index, or from a transfer too short to measure past the warm-up. |
+| `STATUS` | `syncing` when the `Archive-Update-in-Progress` marker is present and confirmed recent — the mirror is mid-rsync, so its tree can change under a reader even though it answers. It is still ranked and shown, demoted below every clean mirror. `stale-lock` when that marker is present but older than an hour, or its age could not be read at all — see below. `marker-unknown` when the mirror serves the archive but its root listing could not be checked. Otherwise `ok`, or the error that made the mirror unusable. Suffixed `(low-confidence)` when the bandwidth figure came from the smaller `Packages.gz` index, or from a transfer too short to measure past the warm-up. |
 
 A `stale-lock` mirror carries a sync marker that is either older than an hour
 or whose age could not be determined at all: a marker whose `Last-Modified`
@@ -343,12 +343,23 @@ before it is trusted at all; if verification fails it is reported as
 unreachable instead. A mirror that passes is still real and usable, but
 ranked below every clean mirror rather than on equal footing.
 
+`marker-unknown` means the release metadata was readable but the archive root
+could not be listed, commonly because directory listing is disabled and the
+root answers 403 or 404, though a timeout or a reset reads the same way.
+aptmir therefore cannot confirm whether a sync marker exists. The mirror
+remains usable and is demoted, sharing the one demoted tier with `syncing` and
+`stale-lock` mirrors rather than sitting below them. Its indexes are not
+verified either: verification is what a marker triggers, and here no marker was
+seen to trigger it. A marker that was seen but could not be confirmed, because
+the confirming request failed rather than came back empty, is reported as
+`stale-lock` and verified like any other lock of unreadable age.
+
 Ranking is by throughput among mirrors that are reachable and no staler than
-`-max-age` (24 h by default), with clean mirrors ranked ahead of `syncing` and
-`stale-lock` ones that passed verification. Ranking demotes a locked mirror
-rather than hiding it. Latency and bandwidth are close to uncorrelated for
-mirrors: a nearby host on a saturated uplink loses to a more distant one behind
-a CDN, which is why bandwidth leads.
+`-max-age` (24 h by default), with clean mirrors ranked ahead of `syncing`,
+`stale-lock`, and `marker-unknown` ones. Ranking demotes these mirrors rather
+than hiding them. Latency and bandwidth are close to uncorrelated for mirrors:
+a nearby host on a saturated uplink loses to a more distant one behind a CDN,
+which is why bandwidth leads.
 
 Every measurement is a single snapshot on one network path. A mirror that
 benchmarks well at 03:00 may be congested at 19:00.

@@ -141,6 +141,53 @@ func TestScreenCleanMirrorSkipsVerification(t *testing.T) {
 	}
 }
 
+// A mirror can serve the archive while refusing to list its root. That does
+// not make it unreachable, but it also must not be presented or ranked as if
+// the absence of a sync marker had been confirmed.
+func TestScreenReportsUnknownMarkerCheckAndDemotesMirror(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/dists/noble/InRelease":
+			_, _ = io.WriteString(w, "Origin: Ubuntu\nDate: "+
+				time.Now().UTC().Format("Mon, 02 Jan 2006 15:04:05 MST")+"\n")
+		case "/":
+			http.Error(w, "directory listing disabled", http.StatusForbidden)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	cfg := &config{codename: "noble", arch: "amd64", timeout: time.Second, maxAge: time.Hour}
+	unknown := &Mirror{URL: srv.URL + "/"}
+	screen(t.Context(), srv.Client(), cfg, unknown)
+
+	if !unknown.Reachable || unknown.Err != "" {
+		t.Errorf("mirror should remain usable after only the marker check fails: %+v", unknown)
+	}
+	if unknown.MarkerStatus != markerUnknown.String() {
+		t.Errorf("MarkerStatus = %q, want %q", unknown.MarkerStatus, markerUnknown.String())
+	}
+	if !unknown.Demoted {
+		t.Error("Demoted = false, want unknown marker state ranked below confirmed-clean mirrors")
+	}
+	if unknown.Verified || unknown.Updating {
+		t.Errorf("unknown marker state must not claim a lock or verification: %+v", unknown)
+	}
+	if !unknown.usable(cfg.maxAge) {
+		t.Errorf("usable() = false, want true: mirror=%+v", unknown)
+	}
+
+	_, rows := tableRows(t, []*Mirror{unknown})
+	if !strings.HasSuffix(rows[0], "marker-unknown") {
+		t.Errorf("row = %q, want it to report marker-unknown instead of ok", rows[0])
+	}
+	clean := &Mirror{URL: "http://clean.example/", Reachable: true, Released: unknown.Released}
+	if got := rank([]*Mirror{unknown, clean}, cfg); got[0] != clean {
+		t.Errorf("ranked first = %s, want confirmed-clean mirror %s", got[0].URL, clean.URL)
+	}
+}
+
 // Screening deliberately has a larger budget than an ordinary request because
 // a marked mirror may need to stream several indexes. The base client timeout
 // must therefore not cut off a valid screening body early.
