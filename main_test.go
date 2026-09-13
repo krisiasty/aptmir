@@ -29,7 +29,7 @@ URIs: http://security.ubuntu.com/ubuntu/
 Suites: noble-security
 Components: main restricted universe multiverse
 `
-	out := rewriteSources(in, mirror, &config{})
+	out := rewriteSources(in, mirror, &config{}, nil)
 	if !strings.Contains(out, "URIs: http://ftp.uni-stuttgart.de/ubuntu") {
 		t.Errorf("archive URI was not redirected:\n%s", out)
 	}
@@ -48,7 +48,7 @@ deb http://security.ubuntu.com/ubuntu jammy-security main
 deb http://ppa.launchpadcontent.net/git-core/ppa/ubuntu jammy main
 # deb http://archive.ubuntu.com/ubuntu jammy universe
 `
-	out := rewriteSources(in, mirror, &config{})
+	out := rewriteSources(in, mirror, &config{}, nil)
 	lines := strings.Split(out, "\n")
 
 	if !strings.HasPrefix(lines[0], "deb http://ftp.uni-stuttgart.de/ubuntu jammy") {
@@ -70,7 +70,7 @@ deb http://ppa.launchpadcontent.net/git-core/ppa/ubuntu jammy main
 
 func TestRewriteIncludeSecurity(t *testing.T) {
 	in := "deb http://security.ubuntu.com/ubuntu noble-security main\n"
-	out := rewriteSources(in, mirror, &config{includeSecurity: true})
+	out := rewriteSources(in, mirror, &config{includeSecurity: true}, nil)
 	if strings.Contains(out, "security.ubuntu.com") {
 		t.Errorf("security should have been redirected: %q", out)
 	}
@@ -78,10 +78,34 @@ func TestRewriteIncludeSecurity(t *testing.T) {
 
 func TestRewriteIdempotent(t *testing.T) {
 	in := "deb http://archive.ubuntu.com/ubuntu noble main\n"
-	once := rewriteSources(in, mirror, &config{})
-	twice := rewriteSources(once, mirror, &config{})
+	once := rewriteSources(in, mirror, &config{}, nil)
+	twice := rewriteSources(once, mirror, &config{}, nil)
 	if once != twice {
 		t.Errorf("not idempotent:\n%q\n%q", once, twice)
+	}
+}
+
+func TestRewriteKnownCatalogueMirror(t *testing.T) {
+	const current = "https://ftp.uni-stuttgart.de/ubuntu/"
+	in := "deb " + current + " noble main restricted universe multiverse\n"
+	known := map[string]struct{}{current: {}}
+
+	out := rewriteSources(in, mirror, &config{}, known)
+	if strings.Contains(out, current) || !strings.Contains(out, mirror[:len(mirror)-1]) {
+		t.Errorf("catalogued Ubuntu mirror was not redirected: %q", out)
+	}
+}
+
+func TestRewriteDoesNotTrustUbuntuSubstringInHostname(t *testing.T) {
+	thirdParty := []string{
+		"https://notubuntu.com/repository/",
+		"https://archive.ubuntu.com.example.org/repository/",
+	}
+	for _, uri := range thirdParty {
+		in := "deb " + uri + " stable main\n"
+		if got := rewriteSources(in, mirror, &config{}, nil); got != in {
+			t.Errorf("third-party source %q was rewritten to %q", in, got)
+		}
 	}
 }
 

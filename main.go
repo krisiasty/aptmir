@@ -262,7 +262,7 @@ func run(ctx context.Context, cfg *config) error {
 
 	announce(fmt.Sprintf("discovering mirrors for %s/%s...", cfg.codename, cfg.arch),
 		"discovering mirrors", "codename", cfg.codename, "arch", cfg.arch)
-	candidates := discover(ctx, client, cfg)
+	candidates, knownArchives := discover(ctx, client, cfg)
 	if len(candidates) == 0 {
 		return errors.New("no candidate mirrors found")
 	}
@@ -326,7 +326,7 @@ func run(ctx context.Context, cfg *config) error {
 				"         sync lock (older than an hour, or of unreadable age) whose tree passed\n"+
 				"         index verification against its own release file.\n", best.URL)
 	}
-	return applyMirror(cfg, best.URL)
+	return applyMirror(cfg, best.URL, knownArchives)
 }
 
 // selectForApply picks the mirror to write into apt sources. Rewriting
@@ -685,13 +685,19 @@ func (cfg *config) archiveRoot() string {
 
 // ---------------------------------------------------------------- discovery
 
-func discover(ctx context.Context, client *http.Client, cfg *config) []*Mirror {
+func discover(ctx context.Context, client *http.Client, cfg *config) ([]*Mirror, map[string]struct{}) {
 	seen := map[string]*Mirror{}
+	knownArchives := map[string]struct{}{}
 	add := func(raw, country string) {
 		raw = normalizeMirrorURL(raw)
 		if raw == "" {
 			return
 		}
+		// Every input to add came from an Ubuntu-operated mirror catalogue or
+		// from the built-in canonical/cloud-provider list. Keep that provenance
+		// even when the candidate is later filtered by architecture or scheme,
+		// so -apply can safely recognise an already-configured official mirror.
+		knownArchives[raw] = struct{}{}
 		// One gate for every source: the geo list, the canonical archive root
 		// and the Launchpad scrape, whose regexp matches ubuntu-ports too.
 		if !servesArch(raw, cfg.arch) || !schemeAllowed(raw, cfg.scheme) {
@@ -785,6 +791,12 @@ func discover(ctx context.Context, client *http.Client, cfg *config) []*Mirror {
 			want[code] = true
 		}
 		for _, m := range lp {
+			// Launchpad is fetched globally before -country narrows the ranking.
+			// Remember every official URL so a source using a mirror in another
+			// country can still be replaced without relying on hostname guesses.
+			if n := normalizeMirrorURL(m.URL); n != "" {
+				knownArchives[n] = struct{}{}
+			}
 			// -country narrows Launchpad too. Without this the flag is
 			// silently ignored whenever -launchpad is given, and a run asking
 			// for one country quietly widens to every mirror in the world.
@@ -807,7 +819,7 @@ func discover(ctx context.Context, client *http.Client, cfg *config) []*Mirror {
 			added[u] = true
 		}
 	}
-	return out
+	return out, knownArchives
 }
 
 // parseCountries splits the -country value into upper-case ISO 3166-1 alpha-2
@@ -1462,7 +1474,7 @@ func formatBehind(m *Mirror) string {
 
 // ---------------------------------------------------------------- apply
 
-func applyMirror(cfg *config, mirror string) error {
+func applyMirror(cfg *config, mirror string, knownArchives map[string]struct{}) error {
 	files, err := sourceFiles()
 	if err != nil {
 		return err
@@ -1481,7 +1493,7 @@ func applyMirror(cfg *config, mirror string) error {
 		if err != nil {
 			return fmt.Errorf("read %s: %w", path, err)
 		}
-		updated := rewriteSources(string(orig), mirror, cfg)
+		updated := rewriteSources(string(orig), mirror, cfg, knownArchives)
 		if updated == string(orig) {
 			continue
 		}
@@ -1568,12 +1580,44 @@ func sourceFiles() ([]string, error) {
 	return out, nil
 }
 
-// ubuntuArchiveRe matches the archive URLs worth redirecting. Third-party
-// repositories and PPAs are deliberately left alone.
-var ubuntuArchiveRe = regexp.MustCompile(
-	`https?://[a-zA-Z0-9.\-]*(?:archive\.ubuntu\.com|ubuntu\.com|ubuntu\.osuosl\.org|ports\.ubuntu\.com)[a-zA-Z0-9./\-]*`)
+// sourceURLRe finds URL tokens on deb and deb822 source lines. Whether a token
+// belongs to Ubuntu is decided from its parsed hostname or exact catalogue URL;
+// the regexp deliberately makes no trust decision of its own.
+var sourceURLRe = regexp.MustCompile(`https?://[^\s#]+`)
 
-func rewriteSources(content, mirror string, cfg *config) string {
+// isCanonicalArchiveHost recognises Ubuntu-operated archive hostnames. Domain
+// boundaries are explicit: archive.ubuntu.com.example.org must not be treated
+// as an Ubuntu host merely because its name contains archive.ubuntu.com.
+func isCanonicalArchiveHost(host string) bool {
+	host = strings.ToLower(host)
+	return host == "archive.ubuntu.com" ||
+		host == "ports.ubuntu.com" ||
+		host == securityHost ||
+		host == "ubuntu.osuosl.org" ||
+		strings.HasSuffix(host, ".archive.ubuntu.com")
+}
+
+// shouldRewriteArchive reports whether raw is an Ubuntu archive root known
+// either by its canonical hostname or by exact membership in the official
+// mirror catalogues fetched during discovery.
+func shouldRewriteArchive(raw string, cfg *config, knownArchives map[string]struct{}) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == securityHost && !cfg.includeSecurity {
+		return false
+	}
+	if isCanonicalArchiveHost(host) {
+		return true
+	}
+	normalized := normalizeMirrorURL(raw)
+	_, ok := knownArchives[normalized]
+	return ok
+}
+
+func rewriteSources(content, mirror string, cfg *config, knownArchives map[string]struct{}) string {
 	lines := strings.Split(content, "\n")
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
@@ -1586,17 +1630,8 @@ func rewriteSources(content, mirror string, cfg *config) string {
 		if !isURI && !isDeb {
 			continue
 		}
-		if strings.Contains(line, "ppa.launchpad") || strings.Contains(line, "ppa.launchpadcontent") {
-			continue
-		}
-		if !cfg.includeSecurity && strings.Contains(line, securityHost) {
-			continue
-		}
-		lines[i] = ubuntuArchiveRe.ReplaceAllStringFunc(line, func(match string) string {
-			if strings.Contains(match, securityHost) && !cfg.includeSecurity {
-				return match
-			}
-			if strings.Contains(match, "ppa.launchpad") {
+		lines[i] = sourceURLRe.ReplaceAllStringFunc(line, func(match string) string {
+			if !shouldRewriteArchive(match, cfg, knownArchives) {
 				return match
 			}
 			return strings.TrimSuffix(mirror, "/")
