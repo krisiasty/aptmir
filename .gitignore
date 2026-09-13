@@ -1,0 +1,6 @@
+.DS_Store
+/aptmir
+*.test
+/graphify-out/
+/dist/
+/docs/superpowers/

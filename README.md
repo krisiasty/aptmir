@@ -1,0 +1,472 @@
+# aptmir
+
+Ranks Ubuntu archive mirrors by measured freshness and throughput, and
+optionally rewrites your apt sources to use the best one. A replacement for
+`apt-smart` that understands the deb822 sources format Ubuntu has shipped by
+default since 24.04, so it works on 22.04 through 26.04 and later.
+
+Standard library only — no dependencies, nothing to break.
+
+## Platforms
+
+Linux is the target: the tool reads `/etc/os-release`, shells out to `dpkg` and
+`lsb_release`, and rewrites `/etc/apt`. Releases also carry macOS binaries for
+development convenience, where autodetection cannot work and `-codename` and
+`-arch` have to be given explicitly. Windows is not built, having none of the
+above.
+
+## Installation
+
+Pre-built binaries for Linux and macOS are available from the
+[GitHub releases page](https://github.com/krisiasty/aptmir/releases).
+
+On macOS, install the Homebrew cask:
+
+```sh
+brew install --cask krisiasty/tap/aptmir
+```
+
+## Usage
+
+Rank mirrors, change nothing:
+
+```sh
+aptmir
+```
+
+Restrict to a specific countries and probe more candidates:
+
+```sh
+aptmir -country pl,de
+```
+
+Measure the cold path using only mirrors published over HTTP:
+
+```sh
+aptmir -no-cache -scheme http
+```
+
+Preview the change to your sources, then apply it:
+
+```sh
+sudo aptmir -apply -dry-run
+sudo aptmir -apply
+sudo apt update
+```
+
+Run `aptmir --help` for the full list of options.
+
+## What it measures
+
+Probing happens in three phases, each narrowing the field for the next.
+
+| Phase | Candidates | What it does | Bound by |
+| --- | --- | --- | --- |
+| 1. Response | all | Time to first byte, best of three probes | `-concurrency` |
+| 2. Screen | closest | Freshness and sync-lock status | `-screen-top`, `-concurrency` |
+| 3. Bandwidth | fastest | Sustained throughput, one mirror at a time | `-probe-top` |
+
+**Phase 1 measures time to first byte, not round-trip latency.** A TCP handshake
+terminates at the nearest CDN edge, so it measures the distance to a point of
+presence rather than to the mirror: a Hong Kong mirror behind Cloudflare
+answered a handshake in 14 ms while its first byte took 691 ms. Ranked on
+handshakes it displaced genuinely fast mirrors out of the field entirely. Each
+candidate gets three probes and the best is kept; see
+[Why response time, not ping](#why-response-time-not-ping) for why three.
+
+**Phase 2 screens the `-screen-top` closest** (50 by default) for freshness —
+the `Date:` field of their `InRelease` — and for an `Archive-Update-in-Progress`
+sync lock. These checks are cheap, but the phase is not uniformly cheap: a
+candidate that turns out to carry a lock also has its indexes verified here,
+which pulls roughly 31 MB from that one mirror, and up to `-concurrency` of
+those can be in flight at once. Verification stays in this phase because it is a
+safety gate — a marked mirror must not reach the ranking until its tree has been
+checked.
+
+**Phase 3 measures bandwidth** on the `-probe-top` fastest (10 by default), one
+mirror at a time rather than concurrently: concurrent downloads compete for your
+own uplink and randomise the result, which is what once made the ranking change
+from run to run. `-probe-top 0` measures every usable candidate instead.
+
+Staleness is decided between phases 2 and 3, so a mirror the ranking would
+reject as too far behind never consumes one of the few measured slots.
+
+### Which candidates are considered
+
+`mirrors.ubuntu.com` returns mirrors for the main archive and the ports archive
+in the same list, and the two are published under different paths. A ports tree
+carries no `binary-amd64` at all, so candidates are filtered to those that can
+actually serve the detected architecture — otherwise a ports mirror with a good
+latency wins a measured slot and then reports itself unreachable.
+
+Every candidate that survives those filters is screened. `-limit` exists only to
+cap a pathologically long list and defaults to no cap, because screening is
+cheap — one `InRelease` fetch of roughly 130 KB per mirror — while `-probe-top`
+already bounds the expensive phase. Capping the list instead samples it: the
+mirror list is returned in a shuffled order, so a `-limit` smaller than the list
+discards a different arbitrary subset on every run, and the fastest mirror may
+simply not be in the part that was kept.
+
+Candidates also come from Launchpad's mirror listing, which is always consulted. It
+names every scheme a mirror offers. Only `http` and `https` are taken from it:
+apt cannot speak `rsync` at all, and it removed its `ftp` method in 2.0, so
+those are mirror-administration protocols rather than usable sources. A mirror's
+archive is recognised anywhere in the URL path, at any depth and in any case,
+because mirrors name the directory as they please — `/pub/Linux/ubuntu/`,
+`/mirror/archive.ubuntu.com/`, `/ubuntu-mirror/archive/` and `/ubuntuarchive/`
+are all real examples from that page.
+
+`-country` takes one code or a comma-separated list, so `-country pl,de,cz`
+searches all three. The mirror service publishes a separate list per country, so
+each code costs one extra list fetch; results are merged in the order given and
+each mirror keeps the country it came from. An empty entry such as `de,,pl` is
+rejected rather than read as "everywhere", because silently widening the search
+is the mistake this flag exists to prevent.
+
+`-country` narrows Launchpad too. The listing groups mirrors under country
+headings, so each candidate is tagged with the country it appears under and
+filtered like the geo list. Launchpad prints ISO 3166-1 English short names,
+inversions included, so the code-to-name table is transcribed from the live page
+rather than guessed — `Korea, Republic of`, not `South Korea`. It covers the 84
+countries that currently host a mirror; a code outside that set is rejected with
+reported as a warning: Launchpad simply contributes nothing for that country and
+the geo list still applies. If the listing cannot be read at all, the run says so
+loudly and continues on the geo list alone.
+
+Combining the two sources is worthwhile: for Germany the geo list offers 42
+candidates and Launchpad adds 16 more, including the `http` form of mirrors the
+geo list publishes only over `https`.
+
+`-scheme` narrows the candidates further to `http` or `https` only. The default,
+`any`, keeps both. Note that a mirror often appears under only one of the two, so
+restricting the scheme can shrink the candidate pool noticeably, and `-scheme
+https` also excludes the plain-HTTP canonical archive that is otherwise added as
+a fallback.
+
+### Why response time, not ping
+
+The sweep measures time to first byte, not a TCP handshake, and the difference
+decides the outcome. A handshake terminates at the nearest CDN edge: a Hong Kong
+mirror behind Cloudflare answered one in 14 ms while its first byte took 691 ms.
+Ranked on handshakes it beat a German mirror that answers in 36 ms, took a slot
+in the screening cut, and pushed genuinely fast mirrors out of it — a worldwide
+run picked a 21.9 MB/s mirror where the right answer was 56 MB/s.
+
+The probe fetches one byte of the detached `Release` file with a unique query
+string. `Release` has no extension, so a front end that caches by extension
+leaves it alone, and the query gives a distinct cache key to any that does not.
+Both matter: with a cacheable target, three probes of the same file went 675 ms,
+57 ms, 48 ms, because the first probe warms the edge and the rest are served
+from it. Taking the best of three would then report a cache entry aptmir created
+itself. **If you ever point this probe at a cacheable file, best-of-three stops
+being valid.**
+
+Three probes rather than one, because they are not only about measuring: they
+absorb a slow DNS answer or a momentary failure. Against the real list one probe
+calls 33-59 hosts dead where three call 13-24, so roughly 20-40 live mirrors per
+run would otherwise be discarded before anything else looked at them.
+
+### Rotations are marked
+
+`archive.ubuntu.com` and its relatives are not servers, they are rotations.
+`archive.ubuntu.com` answers from nine addresses, `security.ubuntu.com` and
+`pl.archive.ubuntu.com` from nine, `us-east-1.ec2.archive.ubuntu.com` from ten;
+`azure.archive.ubuntu.com` rotates through Azure Traffic Manager instead. A real
+mirror answers from one address.
+
+That matters because the backends are not always in the same state. The
+`Archive-Update-in-Progress` marker showed on 2 of 10 requests to
+`archive.ubuntu.com`, and its status flapped between `ok` and `syncing` from one
+run to the next as a result.
+
+So a figure measured against one of these belongs to whichever backend answered,
+not to a server you could pin in your sources, and repeating the run can give a
+different answer for reasons that have nothing to do with the mirror. Such hosts
+are marked `(pool)` in `STATUS` rather than sitting in the table looking like an
+ordinary mirror. They are not demoted: `archive.ubuntu.com` is what Ubuntu ships
+by default and is a perfectly reasonable choice.
+
+Matching is on the hostname. `ftp.hosteurope.de` serves the archive from a path
+containing `archive.ubuntu.com` and is a single server, so it is not marked.
+
+### Caching front ends, and fleets
+
+A mirror behind a CDN is marked in `STATUS`, for example `ok (via cloudflare)`,
+because it inverts which mirror is best and the answer depends on how you use it.
+
+Measured on one such mirror: 5.6 MB/s on a cold fetch, and 43-51 MB/s once the
+edge was warm — beating a direct regional mirror. One machine fetching once pays
+the cold path. A fleet pays it once and then everything else is served warm from
+a nearby edge.
+
+aptmir measures the warm path by default, because it is closer to what apt
+actually does: apt fetches hundreds of files over reused connections, so a cold
+first-fetch penalty is amortised rather than paid per file, and on a fleet the
+edge is warm for everyone after the first machine. Probes are cache-friendly and
+the bandwidth measurement primes the file before timing it, which roughly doubles
+that phase's traffic.
+
+`-no-cache` measures the cold path instead: every probe is forced past the cache
+and the bandwidth figure is a single cold fetch. That is the honest number for a
+one-off fetch on a single machine, and it ranks CDN-fronted mirrors far lower —
+in a worldwide run they were 6 of the top 10 by default and 2 of 10 under
+`-no-cache`.
+
+Note that `-no-cache` is also what keeps best-of-three honest in the sweep. With
+a cacheable target the first probe warms the edge and the next two are served
+from it, so the default deliberately accepts that: it is measuring the warm path,
+which is the point. Under `-no-cache` every probe reaches the origin, so the best
+of the three is a real origin measurement.
+
+### Cloud provider archives
+
+Cloud providers run archive mirrors for their own instances. They are listed
+neither on Launchpad nor in the geo lists, so `-include-csp` names them
+directly: `azure.archive.ubuntu.com`, and every AWS region as
+`<region>.ec2.archive.ubuntu.com`. That adds 57 candidates — Azure plus both
+schemes for 28 regions.
+
+There is no unprefixed `ec2.archive.ubuntu.com`, and nothing tells aptmir which
+region a machine is in, so every region is offered and the response-time sweep
+picks the nearest. From inside the matching region these are usually the best
+choice available: on-network and free of egress charges.
+
+Two others are deliberately absent. `gce.archive.ubuntu.com` does not resolve
+publicly at all, and `oci.archive.ubuntu.com` resolves to Canonical's own
+addresses from outside, so it is not a distinct mirror for anyone who could
+reach it here.
+
+`-include-csp` is not narrowed by `-country`: these are named rather than
+discovered, and AWS regions do not map onto country codes. It also does nothing
+on a ports architecture, because neither provider publishes a ports tree.
+
+Contrary to a common belief, these mirrors **do** carry security updates.
+Checked against `security.ubuntu.com` for both `noble-security` and
+`resolute-security`, Azure and the AWS regions reported an identical `Date:` and
+an identical SHA256, and the `Packages.gz` bytes matched.
+
+### Tracing a run
+
+`-d` (or `-debug`) traces every HTTP request with its status and timing, every
+sweep probe and the best-of-three it produces, every release date read, every
+index verified, every byte counted by the bandwidth phase, and what the
+screening cut kept.
+
+Under `-d` **everything above the results** is [logfmt](https://brandur.org/logfmt),
+written by `log/slog`'s `TextHandler` — the banner and the phase announcements
+as well as the trace itself, so the whole stderr stream parses as one format.
+The blank lines that separate the status block are skipped, a bare newline not
+being logfmt. The results keep their plain layout on stdout.
+
+```text
+time=2026-09-13T15:54:37Z level=DEBUG msg=request method=GET url=http://mirrors.ubuntu.com/PL.txt status=200 dur=92ms
+time=2026-09-13T15:54:37Z level=DEBUG msg=probe mirror=http://ftp.psnc.pl/linux/ubuntu/ ttfb=8.07ms
+time=2026-09-13T15:54:37Z level=DEBUG msg=response mirror=http://ftp.psnc.pl/linux/ubuntu/ best_of=3 ttfb=8.02ms
+time=2026-09-13T15:54:38Z level=DEBUG msg="verify ok" url=http://ubuntu.man.lodz.pl/... bytes=20128002
+time=2026-09-13T15:54:40Z level=DEBUG msg=pull url=http://ftp.psnc.pl/... timed_bytes=6291456 warmup_bytes=2097152
+time=2026-09-13T15:54:40Z level=DEBUG msg=bandwidth mirror=http://ftp.psnc.pl/linux/ubuntu/ rate="42.2 MB/s" low_confidence=false
+```
+
+So `-d 2>&1 | grep msg=probe` gives every probe, and a `cdn=` key appears only
+on mirrors that have a front end.
+
+Two things the trace makes visible that the table cannot. The bandwidth phase
+logs two `pull` lines per mirror by default, because caching is allowed and the
+file is primed before being timed; under `-no-cache` there is one. And the three
+probes are logged individually beside the `response` that summarises them, so a
+mirror whose first probe was unlucky can be told from one that is genuinely slow.
+
+The once-a-second `x/y` progress counts are suppressed under `-d`. The trace
+already reports each probe, verification and measurement as it happens, so a
+periodic count of them is noise laid over the detail it summarises. The phase
+announcements stay, which keeps a long trace navigable.
+
+### Output layout
+
+The first line names the program and its version, then a blank line, then one
+status line per phase, then a blank line before the results:
+
+```text
+aptmir 1.2.0 (commit a1b2c3d, built 2026-09-13T10:00:00Z)
+
+discovering mirrors for resolute/amd64...
+measuring response time to 115 candidates...
+measured 115/115
+screening 50 closest candidates (freshness, sync locks)...
+screened 50/50
+measuring bandwidth on the 10 fastest candidates, one at a time...
+measured bandwidth on 10/10
+
+#    MIRROR                                     BANDWIDTH  RESPONSE  ...
+```
+
+Everything above the results goes to stderr and everything below it to stdout,
+including both blank lines, so redirecting stdout gives the table and the
+summary and nothing else. `-version` prints the same version string on its own
+to stdout and exits.
+
+### Progress output
+
+Each phase prints one short line to stderr as it starts, so a run that spends
+half a minute probing does not look like it has hung. Results go to stdout, so
+the table and `-json` stay clean when stderr is redirected away.
+
+Bandwidth is measured by downloading a `Range` of the real `Contents-<arch>.gz`
+index (falling back to the smaller `Packages.gz` when that index is
+unavailable, which is flagged `(low-confidence)` in the STATUS column since a
+smaller sample is a less trustworthy measurement), discarding an initial
+warm-up before starting the clock. TCP's slow-start ramp-up otherwise makes a
+short probe measure how fast the congestion window opened rather than what
+the mirror can sustain, so the reported number reflects sustained throughput.
+`-probe-bytes` sets how many bytes are timed in that measurement window,
+after the warm-up is discarded; `-probe-time` bounds how long it may take.
+
+For each candidate mirror, the table reports:
+
+| Column | Meaning |
+| --- | --- |
+| `BANDWIDTH` | Sustained bytes per second measured over `-probe-bytes` worth of data, after discarding a fixed warm-up. |
+| `RESPONSE` | Fastest of three time-to-first-byte probes. This is what decides which candidates are screened at all. |
+| `BEHIND` | Hours between this mirror's `InRelease` `Date:` field and the official archive's. Measured directly, not read off a status page. |
+| `STATUS` | `syncing` when the `Archive-Update-in-Progress` marker is present and confirmed recent — the mirror is mid-rsync, so its tree can change under a reader even though it answers. It is still ranked and shown, demoted below every clean mirror, but `-apply` never writes it to your sources. `stale-lock` when that marker is present but older than an hour, or its age could not be read at all — see below. Otherwise `ok`, or the error that made the mirror unusable. Suffixed `(low-confidence)` when the bandwidth figure came from the smaller `Packages.gz` index, or from a transfer too short to measure past the warm-up. |
+
+A `stale-lock` mirror carries a sync marker that is either older than an hour
+or whose age could not be determined at all: a marker whose `Last-Modified`
+is missing or unparsable is treated as stale rather than as an active sync,
+so an unreadable age never gets the benefit of the doubt. Either way, the
+sync that left the marker almost certainly died without cleaning up, rather
+than one still running. Because a leaked lock can leave a tree mid-mutation,
+such a mirror is verified against the hashes recorded in its own `InRelease`
+before it is trusted at all; if verification fails it is reported as
+unreachable instead. A mirror that passes is still real and usable, but
+ranked below every clean mirror rather than on equal footing.
+
+Ranking is by throughput among mirrors that are reachable and no staler than
+`-max-age` (24 h by default), with clean mirrors ranked ahead of `syncing` and
+`stale-lock` ones that passed verification. Ranking demotes a locked mirror
+rather than hiding it; `-apply` is stricter, and refuses one that is actively
+syncing outright. Latency and bandwidth are close to uncorrelated for mirrors:
+a nearby host on a saturated uplink loses to a more distant one behind a CDN,
+which is why bandwidth leads.
+
+Every measurement is a single snapshot on one network path. A mirror that
+benchmarks well at 03:00 may be congested at 19:00.
+
+## Summary
+
+Below the table, separated by a blank line, each measured column is summarised:
+
+```text
+                  MIN        P50       MEAN        P90        P95        MAX  SAMPLES
+RESPONSE         7 ms      18 ms      17 ms      22 ms      22 ms      22 ms  15
+BANDWIDTH   19.3 MB/s  30.8 MB/s  34.1 MB/s  58.6 MB/s  58.6 MB/s  58.6 MB/s  6
+```
+
+Percentiles are nearest-rank rather than interpolated: these samples are small,
+and an interpolated figure would imply a precision they do not carry.
+
+The two rows carry separate sample counts because they are not drawn from the
+same set. Every screened mirror has a response time, but only the `-probe-top`
+fastest are measured for bandwidth, so with the default of five the bandwidth
+`P90` is rarely distinguishable from `MAX`. `SAMPLES` is there to make that
+visible rather than leave it implied. Raise `-probe-top` if you want the
+bandwidth percentiles to mean something.
+
+Note the two rows read in opposite directions: for `RESPONSE` lower is better,
+for `BANDWIDTH` higher is.
+
+## Safety
+
+`-apply` only rewrites URIs pointing at the Ubuntu archive. It leaves alone:
+
+- `security.ubuntu.com` (override with `-include-security`, not recommended —
+  you want security updates from the canonical source)
+- PPAs and any third-party repository
+- commented-out lines
+
+Each modified file is backed up alongside the original as
+`<file>.aptmir-<timestamp>` before anything is written. The rewrite is
+idempotent, so running it twice is harmless.
+
+`-apply` will not choose a `stale-lock` mirror unless no clean mirror
+qualifies at all, and it prints a warning to stderr on the run it does — it
+never falls back silently.
+
+`-apply` never chooses a `syncing` mirror, not even as a last resort. A lock
+younger than an hour means the tree is being rewritten right now, so verifying
+it proves something only for the instant the check ran — which is not enough to
+justify a persistent change to `/etc/apt`. A leaked (`stale-lock`) mirror is
+different: its tree is static, so a passing verification still means something
+afterwards, which is why that one remains available as a reported fallback. If
+nothing acceptable is left, `-apply` fails with an error and writes nothing.
+
+## Notes on releases
+
+- The codename comes from `/etc/os-release` first, which is authoritative and
+  present on every supported release. The sources files are a fallback, and
+  only stanzas pointing at an Ubuntu archive are considered — a third-party
+  repo such as NodeSource (`Suites: nodistro`) cannot be mistaken for the
+  release.
+- Both `/etc/apt/sources.list` (legacy one-line) and
+  `/etc/apt/sources.list.d/*.sources` (deb822) are parsed and rewritten, so no
+  release-specific handling is needed as new versions land.
+- If the release is end-of-life, the tool detects that the archive no longer
+  carries it and points you at `old-releases.ubuntu.com` rather than ranking
+  mirrors that cannot serve you.
+- On arm64/ppc64el/s390x/riscv64 it uses `ports.ubuntu.com`. Since
+  `mirrors.ubuntu.com` only indexes the main archive, Launchpad is the only
+  those architectures to pull a wider candidate list.
+
+## Flags
+
+```text
+-codename string     release codename (default: autodetect)
+-arch string         dpkg architecture (default: autodetect)
+-country string      restrict to these countries, comma-separated two-letter codes, e.g. DE,PL
+-scheme string       keep only candidates already published under this scheme: http, https, or any (default any)
+-limit int           cap the candidate list at this many mirrors, 0 for no cap (default 0)
+-screen-top int      check freshness and sync locks on this many closest candidates (default 50)
+-no-cache            force probes past any CDN cache, measuring the cold first-fetch path
+-include-csp         also consider the cloud provider archives (AWS regional, Azure)
+-max-age duration    reject mirrors staler than this (default 24h)
+-concurrency int     parallel probes (default 30)
+-timeout duration    per-request timeout (default 10s)
+-probe-top int       measure bandwidth on this many best candidates, 0 for all (default 10)
+-probe-bytes int     bytes timed per bandwidth probe, after a fixed warm-up is discarded (default 6 MiB)
+-probe-time duration max duration per bandwidth probe (default 4s)
+-no-bandwidth        skip throughput probes, rank on latency
+-json                emit JSON instead of a table
+-apply               rewrite apt sources to the winning mirror
+-dry-run             with -apply, show the result without writing
+-include-security    also redirect security.ubuntu.com entries
+-d, -debug           trace every request, result and measurement on stderr
+-v, -version         print version information and exit
+```
+
+## Tests
+
+```sh
+go test -race ./...
+```
+
+Everything runs against in-process `httptest` servers — a synthetic Ubuntu
+archive with a real `SHA256` stanza, plus purpose-built servers for the hostile
+cases — so the suite needs no network and touches no real mirror.
+
+| Area | What is covered |
+| --- | --- |
+| Sources rewriting | deb822 and legacy formats, `security.ubuntu.com` and PPA preservation, idempotency, and that a rewrite lands by atomic rename rather than in place |
+| Release detection | suite parsing, `Date:` field parsing, codename detection inputs |
+| Sync markers | absent, fresh, and stale markers; a pool that flaps per request and one that flaps per connection, which is how a real load-balanced host behaves |
+| Index verification | a good mirror, a corrupt index, a mirror publishing only `Release`, an index declaring an implausible size, a declared index the mirror does not serve, and a mirror that streams a body forever |
+| Probing | phase 3 runs strictly sequentially, three probes reach each mirror, the warm-up is excluded from the timed window, a body ending exactly at the warm-up boundary, the low-confidence fallback, and stale candidates not consuming `-probe-top` slots |
+| Caching | cache-busting by default and a cacheable target under `-no-cache`'s inverse, CDN detection across Cloudflare, Fastly, Varnish and CloudFront headers, and the bandwidth phase priming before it times |
+| Candidate discovery | architecture filtering of ports versus main-archive URLs, `-scheme` filtering, `-country` list parsing, Launchpad link extraction against real URL shapes, the ISO country table, and the cloud provider archives including their exclusion on ports |
+| Rotations | `archive.ubuntu.com` and its relatives recognised as pools, a single-server mirror serving from a path containing `archive.ubuntu.com` not mistaken for one |
+| Ranking and `-apply` | clean mirrors above demoted ones, `-apply` preferring a clean mirror, falling back to a verified stale lock, and never selecting a syncing one |
+| Staleness | the freshest evidence winning over a lagging pool backend, and a forged future date disregarded |
+| Flags | `-concurrency`, `-probe-bytes`, `-probe-time`, `-timeout`, `-probe-top`, `-screen-top`, `-limit`, `-scheme` and `-country` validation |
+| Errors | transport failures rendered short: TLS handshake timeout, connection refused, DNS failure, deadline |
+| Output | table column alignment including low-confidence, error, pool and CDN rows; the summary block's percentiles, per-row sample counts and blank-line separation |
+| Debug tracing | silent until enabled, logfmt shape including quoting, fifty concurrent writers without an interleaved line, progress counts suppressed under `-d`, and every line above the results structured |
+| Version | `-v` and `-version`, and each build field individually present in the version string |

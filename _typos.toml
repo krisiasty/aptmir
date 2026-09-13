@@ -1,0 +1,11 @@
+# The SDD working records under docs/superpowers are a transcript of how the
+# tool was built rather than documentation that ships, and graphify-out is
+# generated.
+[files]
+extend-exclude = ["docs/superpowers/**", "graphify-out/**"]
+
+[default.extend-words]
+# ISO 3166 names and codes, quoted verbatim from Launchpad's mirror listing so
+# that a country heading can be matched against them.
+Nam = "Nam" # "Viet Nam"
+BA = "BA"   # Bosnia and Herzegovina
