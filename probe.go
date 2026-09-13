@@ -348,14 +348,12 @@ func screenAll(ctx context.Context, client *http.Client, cfg *config, mirrors []
 	return mirrors
 }
 
-// screenBudgetFactor turns the per-request timeout into a whole-of-phase-1
-// budget for a single mirror. cfg.timeout bounds one request — and only up to
-// the response headers, since ResponseHeaderTimeout has already fired by the
-// time a body is being read — so nothing downstream bounds a mirror that
-// answers promptly and then streams its index body slowly or forever. At the
-// default 10 s timeout this gives each mirror 90 s, which covers the ~31 MB
-// verification set down to about 350 kB/s, far below any mirror worth ranking,
-// while guaranteeing that no single mirror can stall the whole run.
+// screenBudgetFactor turns the base request timeout into a whole-of-screening
+// budget for a single mirror. Screening may download roughly 31 MB across
+// several indexes, so the ordinary 10 s body timeout would reject a valid but
+// slow mirror. Giving both the client and the enclosing context 90 s covers
+// about 350 kB/s, far below any mirror worth ranking, while still guaranteeing
+// that no single mirror can stall the whole run.
 const screenBudgetFactor = 9
 
 // screenBudget is how long one mirror gets for the whole of phase 1.
@@ -369,8 +367,10 @@ func screenBudget(timeout time.Duration) time.Duration {
 func screen(ctx context.Context, client *http.Client, cfg *config, m *Mirror) {
 	m.Pool = isPoolHost(m.URL)
 
-	ctx, cancel := context.WithTimeout(ctx, screenBudget(cfg.timeout))
+	budget := screenBudget(cfg.timeout)
+	ctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
+	client = clientWithTimeout(client, budget)
 
 	date, err := fetchReleaseDate(ctx, client, cfg, m.URL)
 	if err != nil {
@@ -596,8 +596,10 @@ func measureBandwidth(ctx context.Context, client *http.Client, cfg *config, bas
 // The second result reports that it could not do that and timed the whole
 // transfer instead, which makes the figure low-confidence whatever the target.
 func timedPull(ctx context.Context, client *http.Client, cfg *config, u string) (float64, bool, error) {
-	ctx, cancel := context.WithTimeout(ctx, cfg.probeTime+2*cfg.timeout)
+	budget := cfg.probeTime + 2*cfg.timeout
+	ctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
+	client = clientWithTimeout(client, budget)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {

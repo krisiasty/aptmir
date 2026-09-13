@@ -316,6 +316,11 @@ the mirror can sustain, so the reported number reflects sustained throughput.
 `-probe-bytes` sets how many bytes are timed in that measurement window,
 after the warm-up is discarded; `-probe-time` bounds how long it may take.
 
+`-timeout` bounds a complete ordinary HTTP request, including its response
+body. Screening may spend up to nine times that value on one mirror because it
+can verify several large indexes; bandwidth probes use `-probe-time` plus
+connection overhead. Both longer phases remain bounded.
+
 For each candidate mirror, the table reports:
 
 | Column | Meaning |
@@ -413,7 +418,7 @@ change deliberately.
 -include-csp         also consider the cloud provider archives (AWS regional, Azure)
 -max-age duration    reject mirrors staler than this (default 24h)
 -concurrency int     parallel probes (default 30)
--timeout duration    per-request timeout (default 10s)
+-timeout duration    base timeout for a complete HTTP request (default 10s)
 -probe-top int       measure bandwidth on this many best candidates, 0 for all (default 10)
 -probe-bytes int     bytes timed per bandwidth probe, after a fixed warm-up is discarded (default 6 MiB)
 -probe-time duration max duration per bandwidth probe (default 4s)

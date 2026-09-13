@@ -134,7 +134,8 @@ func registerFlags(fs *flag.FlagSet, cfg *config) {
 	fs.StringVar(&cfg.country, "country", "",
 		"restrict to these countries, comma-separated two-letter codes, e.g. DE,PL")
 	fs.IntVar(&cfg.concurrency, "concurrency", 30, "parallel probes")
-	fs.DurationVar(&cfg.timeout, "timeout", 10*time.Second, "per-request timeout")
+	fs.DurationVar(&cfg.timeout, "timeout", 10*time.Second,
+		"base timeout for a complete HTTP request")
 	fs.Int64Var(&cfg.probeBytes, "probe-bytes", measureBytes,
 		"bytes timed per bandwidth probe, measured after a fixed warm-up is discarded")
 	fs.DurationVar(&cfg.probeTime, "probe-time", 4*time.Second, "max duration per bandwidth probe")
@@ -362,7 +363,17 @@ func newClient(timeout time.Duration) *http.Client {
 		MaxIdleConnsPerHost:   2,
 		DisableCompression:    true,
 	}
-	return &http.Client{Transport: tr}
+	return &http.Client{Transport: tr, Timeout: timeout}
+}
+
+// clientWithTimeout copies a client while sharing its transport. Most requests
+// use cfg.timeout through newClient; phases with an explicit, longer whole-task
+// budget use that budget for response bodies too rather than being cut short by
+// the base client timeout.
+func clientWithTimeout(client *http.Client, timeout time.Duration) *http.Client {
+	clone := *client
+	clone.Timeout = timeout
+	return &clone
 }
 
 // warnf reports degraded service. Unlike logf it is not gated on -v, because
