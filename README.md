@@ -317,9 +317,11 @@ the mirror can sustain, so the reported number reflects sustained throughput.
 after the warm-up is discarded; `-probe-time` bounds how long it may take.
 
 `-timeout` bounds a complete ordinary HTTP request, including its response
-body. Screening may spend up to nine times that value on one mirror because it
-can verify several large indexes; bandwidth probes use `-probe-time` plus
-connection overhead. Both longer phases remain bounded.
+body. Three phases need longer and are budgeted separately: screening may spend
+up to nine times that value on one mirror because it can verify several large
+indexes; bandwidth probes use `-probe-time` plus connection overhead; and the
+Launchpad mirror listing, a few hundred kilobytes fetched once, gets three times
+the timeout. All three remain bounded.
 
 For each candidate mirror, the table reports:
 

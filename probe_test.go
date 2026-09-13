@@ -35,17 +35,26 @@ func TestNewClientBoundsResponseBody(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL, nil)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
-	start := time.Now()
 	resp, err := newClient(timeout).Do(req)
 	if err != nil {
 		t.Fatalf("request headers: %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if _, err := io.ReadAll(resp.Body); err == nil {
+
+	// Bounded, because the handler never ends the body on its own: without
+	// this a regression hangs the whole test binary instead of failing here.
+	start := time.Now()
+	var readErr error
+	if !runBounded(t, 10*time.Second, func() { _, readErr = io.ReadAll(resp.Body) }) {
+		t.Fatal("body read did not return within 10s: the complete-request timeout is not bounding it")
+	}
+	if readErr == nil {
 		t.Fatal("body read succeeded; want the complete-request timeout to interrupt it")
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {

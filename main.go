@@ -727,7 +727,7 @@ func discover(ctx context.Context, client *http.Client, cfg *config) []*Mirror {
 		// source of alternatives at all. Failure here is degraded service, not
 		// a fatal error, but it is loud: a run quietly losing most of its
 		// candidates is exactly what nobody notices.
-		lp, err := fetchLaunchpadMirrors(ctx, client)
+		lp, err := fetchLaunchpadMirrors(ctx, client, launchpadMirrors, cfg.timeout)
 		if err != nil {
 			warnf("could not read the Launchpad mirror list (%v);\n"+
 				"         continuing with the geo list alone, which lists fewer mirrors\n"+
@@ -1175,8 +1175,26 @@ func parseLaunchpadMirrors(page []byte) []lpMirror {
 	return out
 }
 
-func fetchLaunchpadMirrors(ctx context.Context, client *http.Client) ([]lpMirror, error) {
-	body, err := get(ctx, client, launchpadMirrors)
+// launchpadBudgetFactor extends the per-request timeout for the one discovery
+// fetch that reads a large page. The listing is a few hundred kilobytes from a
+// host that is often slow to first byte, so bounding its body by cfg.timeout
+// would drop the run's only source of ports mirrors and https variants on a
+// merely slow link — the quiet loss of candidates the caller warns about.
+// Three times the timeout is still a hard ceiling: discovery cannot stall.
+const launchpadBudgetFactor = 3
+
+// launchpadBudget is how long reading the Launchpad mirror listing gets.
+func launchpadBudget(timeout time.Duration) time.Duration {
+	return time.Duration(launchpadBudgetFactor) * timeout
+}
+
+func fetchLaunchpadMirrors(ctx context.Context, client *http.Client, listURL string, timeout time.Duration) ([]lpMirror, error) {
+	budget := launchpadBudget(timeout)
+	ctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	client = clientWithTimeout(client, budget)
+
+	body, err := get(ctx, client, listURL)
 	if err != nil {
 		return nil, err
 	}
